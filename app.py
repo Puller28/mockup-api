@@ -91,35 +91,74 @@ def call_runsync(payload: dict, timeout_sec: int = 420) -> dict:
 
 def extract_images_from_output(status_payload: dict) -> List[str]:
     """
-    Normalize outputs. Supports:
-    - {"output":{"images":[{"url":...},{"base64":...}]}}
-    - {"output":{"image_url": "..."}}
-    - {"output":{"urls":[...]}}
-    - {"output":{"base64":[...]}}
+    Normalize a variety of RunPod/ComfyUI output shapes into a list of displayable image strings.
+    Preference order: URLs -> data URLs -> file paths (last resort).
     """
-    out = status_payload.get("output", {}) or {}
+    out = (status_payload or {}).get("output") or {}
 
+    results: List[str] = []
+
+    # 1) {"output":{"images":[{"url"...}|{"base64"...}|{"content"...}|{"path"...}]}}
     imgs = out.get("images")
-    results = []
     if isinstance(imgs, list):
         for it in imgs:
             if isinstance(it, dict):
-                if "url" in it and it["url"]:
+                if it.get("url"):
                     results.append(it["url"])
-                elif "base64" in it and it["base64"]:
+                elif it.get("base64"):
                     results.append("data:image/png;base64," + it["base64"])
+                elif it.get("content"):
+                    results.append("data:image/png;base64," + it["content"])
+                elif it.get("path"):
+                    results.append(it["path"])
+            elif isinstance(it, str):
+                if it.startswith("http"):
+                    results.append(it)
+                else:
+                    results.append("data:image/png;base64," + it)
         if results:
             return results
 
-    if "image_url" in out and out["image_url"]:
+    # 2) {"output":{"urls":[...]}}
+    urls = out.get("urls")
+    if isinstance(urls, list) and urls:
+        return urls
+
+    # 3) {"output":{"image_url":"..."}}
+    if isinstance(out.get("image_url"), str) and out["image_url"]:
         return [out["image_url"]]
 
-    if "urls" in out and isinstance(out["urls"], list) and out["urls"]:
-        return out["urls"]
+    # 4) {"output":{"base64":[...]}}
+    b64s = out.get("base64")
+    if isinstance(b64s, list) and b64s:
+        return ["data:image/png;base64," + b for b in b64s if isinstance(b, str) and b]
 
-    if "base64" in out and isinstance(out["base64"], list) and out["base64"]:
-        return ["data:image/png;base64," + b for b in out["base64"]]
+    # 5) {"output":{"data":[{"images":[...]}, ...]}}
+    data_arr = out.get("data")
+    if isinstance(data_arr, list):
+        for item in data_arr:
+            if isinstance(item, dict) and isinstance(item.get("images"), list):
+                for it in item["images"]:
+                    if isinstance(it, dict):
+                        if it.get("url"):
+                            results.append(it["url"])
+                        elif it.get("base64"):
+                            results.append("data:image/png;base64," + it["base64"])
+                        elif it.get("content"):
+                            results.append("data:image/png;base64," + it["content"])
+                    elif isinstance(it, str):
+                        if it.startswith("http"):
+                            results.append(it)
+                        else:
+                            results.append("data:image/png;base64," + it)
+        if results:
+            return results
 
+    # 6) {"output":{"image_path":"..."}}
+    if isinstance(out.get("image_path"), str) and out["image_path"]:
+        return [out["image_path"]]
+
+    # 7) Nothing recognized
     return []
 
 # ========= ComfyUI WORKFLOW =========
@@ -259,6 +298,14 @@ async def batch(template: str = Form(...), file: UploadFile = File(...)):
         wf_input = build_comfyui_workflow(prompt_text, b64, seed=1234567 + i)
         payload = { "input": { "return_type": "base64", **wf_input } }
         result = call_runsync(payload, timeout_sec=420)
+
+        # TEMP: log first result for debugging
+        if i == 0:
+            try:
+                print("RUNPOD_RAW_SAMPLE:", json.dumps(result)[:4000])
+            except Exception:
+                print("RUNPOD_RAW_SAMPLE: <non-serializable>")
+
         outs = extract_images_from_output(result)
         images_all.append(outs[0] if outs else "MISSING")
 
