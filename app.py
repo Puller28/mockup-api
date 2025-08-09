@@ -64,7 +64,6 @@ def _headers():
     return {
         "Authorization": f"Bearer {RUNPOD_API_KEY}",
         "Content-Type": "application/json",
-        # reduce chance of chunked/compressed mid-stream breaks
         "Accept-Encoding": "identity",
         "Connection": "close",
     }
@@ -75,9 +74,21 @@ def strip_data_url(b64_str: str) -> str:
         return b64_str.split(";base64,", 1)[1]
     return b64_str
 
+def guess_mime(upload: UploadFile) -> str:
+    # Prefer provided content_type, fallback to filename
+    ct = (upload.content_type or "").lower()
+    if ct in {"image/png", "image/jpeg", "image/jpg", "image/webp"}:
+        return "image/jpeg" if ct == "image/jpg" else ct
+    name = (upload.filename or "").lower()
+    if name.endswith(".png"): return "image/png"
+    if name.endswith(".jpg") or name.endswith(".jpeg"): return "image/jpeg"
+    if name.endswith(".webp"): return "image/webp"
+    # default safe bet
+    return "image/png"
+
 def call_runsync(payload: dict, timeout_sec: int = 420) -> dict:
     """One-shot RunPod call (no polling)."""
-    url = f"{RUNPOD_ENDPOINT}/runsync"  # IMPORTANT: runsync
+    url = f"{RUNPOD_ENDPOINT}/runsync"
     try:
         r = SESSION.post(url, json=payload, headers=_headers(), timeout=timeout_sec)
     except (ChunkedEncodingError, ProtocolError, ConnectionError, ReadTimeout) as e:
@@ -98,7 +109,7 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
 
     results: List[str] = []
 
-    # 1) {"output":{"images":[{"url"...}|{"base64"...}|{"content"...}|{"path"...}]}}
+    # 1) {"output":{"images":[...]}}
     imgs = out.get("images")
     if isinstance(imgs, list):
         for it in imgs:
@@ -107,7 +118,7 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
                     results.append(it["url"])
                 elif it.get("base64"):
                     results.append("data:image/png;base64," + it["base64"])
-                elif it.get("content"):
+                elif it.get("content"):  # some wrappers use 'content' for base64
                     results.append("data:image/png;base64," + it["content"])
                 elif it.get("path"):
                     results.append(it["path"])
@@ -162,7 +173,7 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
     return []
 
 # ========= ComfyUI WORKFLOW =========
-def build_comfyui_workflow(prompt: str, art_b64_no_prefix: str, seed: int) -> dict:
+def build_comfyui_workflow(prompt: str, art_image_data_url: str, seed: int) -> dict:
     """
     Stock ComfyUI nodes. Background is generated; your art is preserved (no diffusion).
     Placement: 1024x1024 canvas, 512x512 art centered (x=y=32 latent units = 256 px).
@@ -230,7 +241,7 @@ def build_comfyui_workflow(prompt: str, art_b64_no_prefix: str, seed: int) -> di
                 "denoise": 1.0
             }
         },
-        "7": {  # Composite art onto background (no feather, no tiling)
+        "7": {  # Composite art onto background (no feather)
             "class_type": "LatentComposite",
             "inputs": {
                 "samples_to": ["6", 0],   # background latent
@@ -257,16 +268,13 @@ def build_comfyui_workflow(prompt: str, art_b64_no_prefix: str, seed: int) -> di
         }
     }
 
-    # RunPod ComfyUI wrapper convention:
-    # - graph is under "workflow"
-    # - uploaded images are under top-level "images"
-        return {
+    # IMPORTANT: your worker requires {name, image} and wants a data URL in 'image'
+    return {
         "workflow": workflow_graph,
         "images": [
-            { "name": "art.png", "image": art_b64_no_prefix }  # <- keys changed
+            { "name": "art.png", "image": art_image_data_url }
         ]
     }
-
 
 # ========= ROUTES =========
 @app.get("/")
@@ -286,17 +294,20 @@ async def batch(template: str = Form(...), file: UploadFile = File(...)):
     if template not in TEMPLATES:
         raise HTTPException(status_code=400, detail=f"Invalid template. Available: {list(TEMPLATES.keys())}")
 
-    # read upload and base64 encode (no data: prefix)
+    # read upload -> base64 (no prefix), then build proper data URL with correct MIME
     raw = await file.read()
     b64 = base64.b64encode(raw).decode("utf-8")
     b64 = strip_data_url(b64)
+
+    mime = guess_mime(file)  # e.g. image/png or image/jpeg
+    data_url = f"data:{mime};base64,{b64}"
 
     prompt_text = TEMPLATES[template]
 
     images_all: List[str] = []
     # 5 variations via seed offsets
     for i in range(5):
-        wf_input = build_comfyui_workflow(prompt_text, b64, seed=1234567 + i)
+        wf_input = build_comfyui_workflow(prompt_text, data_url, seed=1234567 + i)
         payload = { "input": { "return_type": "base64", **wf_input } }
         result = call_runsync(payload, timeout_sec=420)
 
