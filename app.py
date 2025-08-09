@@ -165,7 +165,7 @@ def build_comfyui_workflow(prompt: str, art_b64_no_prefix: str, seed: int) -> di
             "class_type": "CLIPTextEncode",
             "inputs": {
                 "clip": ["100", 1],
-                "text": "blurry, low detail, distorted, bad framing, artifacts, low quality, overexposed, underexposed"
+                "text": NEGATIVE_PROMPT
             }
         },
         "5": {  # Empty background latent 1024x1024
@@ -246,6 +246,7 @@ async def batch(template: str = Form(...), file: UploadFile = File(...)):
     if template not in TEMPLATES:
         raise HTTPException(status_code=400, detail=f"Invalid template. Available: {list(TEMPLATES.keys())}")
 
+    # read upload and base64 encode (no data: prefix)
     raw = await file.read()
     b64 = base64.b64encode(raw).decode("utf-8")
     b64 = strip_data_url(b64)
@@ -256,7 +257,7 @@ async def batch(template: str = Form(...), file: UploadFile = File(...)):
     # 5 variations via seed offsets
     for i in range(5):
         wf_input = build_comfyui_workflow(prompt_text, b64, seed=1234567 + i)
-        payload = { "input": wf_input }
+        payload = { "input": { "return_type": "base64", **wf_input } }
         result = call_runsync(payload, timeout_sec=420)
         outs = extract_images_from_output(result)
         images_all.append(outs[0] if outs else "MISSING")
