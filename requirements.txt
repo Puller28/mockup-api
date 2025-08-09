@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-python-multipart
-pydantic
 requests
+pydantic
+python-multipart

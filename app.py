@@ -1,121 +1,117 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+import os
+import base64
+import time
+import requests
+from fastapi import FastAPI, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
-import base64
-import requests
-import os
-import uuid
-import time
 
-# ===== CONFIG =====
-RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT")  # e.g., https://xxxxx.api.runpod.ai/v2/worker-id/run
+# Load environment variables
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
+RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT")  # e.g. https://xxxx.api.runpod.ai
 
+if not RUNPOD_API_KEY or not RUNPOD_ENDPOINT:
+    raise RuntimeError("RUNPOD_API_KEY and RUNPOD_ENDPOINT must be set as environment variables")
+
+# Templates: prompt text for each room style
 TEMPLATES = {
-    "bedroom": "Framed artwork hanging in a cozy bedroom with sunlight filtering through linen curtains",
-    "gallery_wall": "Framed print on a gallery wall with spot lighting and minimal decor",
-    "modern_lounge": "Framed abstract painting in a modern minimalist lounge with natural lighting",
-    "rustic_study": "Framed vintage map in a rustic study with wooden shelves and warm desk lamp lighting",
-    "kitchen": "Framed botanical print in a bright, modern kitchen with potted plants"
+    "bedroom": "A cozy, photorealistic bedroom with soft window light, neutral tones, and a framed artwork hanging above the bed. Realistic textures, natural shadows, DSLR photography style.",
+    "gallery_wall": "A modern art gallery wall with minimal decor, soft spot lighting, and a framed artwork. Photorealistic interior design photography."
 }
 
-# ===== FASTAPI =====
+# FastAPI init
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"],  # Allow frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-class BatchResponse(BaseModel):
-    urls: List[str]
+class MockupResponse(BaseModel):
+    template: str
+    prompt: str
+    images: List[str]
 
-# ===== UTIL =====
-def image_to_base64(file_path: str) -> str:
-    with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
+@app.post("/batch", response_model=MockupResponse)
+async def generate_batch(template: str = Form(...), file: UploadFile = None):
+    """
+    Generates 5 mockups for the given template and uploaded image.
+    """
+    if template not in TEMPLATES:
+        raise HTTPException(status_code=400, detail=f"Invalid template. Available: {list(TEMPLATES.keys())}")
 
-def poll_runpod(job_id: str, timeout: int = 120):
-    """Poll RunPod until job completes or fails."""
-    status_url = RUNPOD_ENDPOINT.replace("/run", f"/status/{job_id}")
-    headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}"}
-    start_time = time.time()
+    if not file:
+        raise HTTPException(status_code=400, detail="No image file uploaded")
 
-    while time.time() - start_time < timeout:
-        r = requests.get(status_url, headers=headers)
-        if r.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"RunPod status error: {r.text}")
-        data = r.json()
-        if data.get("status") == "COMPLETED":
-            return data
-        elif data.get("status") == "FAILED":
-            raise HTTPException(status_code=500, detail=f"RunPod job failed: {data}")
-        time.sleep(3)
+    # Read and encode uploaded image
+    img_bytes = await file.read()
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-    raise HTTPException(status_code=500, detail="RunPod job polling timed out")
+    prompt_text = TEMPLATES[template]
 
-def runpod_request(prompt: str, base64_image: str):
-    # ===== Hybrid composite workflow JSON =====
-    workflow = {
-        "nodes": [
-            # This is where your LAST WORKING JSON goes, unchanged
-            # Replace this with the exact JSON we tested that produces correct background + image placement
-        ]
-    }
-
+    # Build the RunPod payload
     payload = {
         "input": {
-            "workflow": workflow,
-            "prompt": prompt,
-            "image": base64_image
+            "workflow": build_workflow(prompt_text, img_b64, num_outputs=5)
         }
     }
 
+    # Submit job to RunPod
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {RUNPOD_API_KEY}"
     }
+    submit_resp = requests.post(f"{RUNPOD_ENDPOINT}/run", json=payload, headers=headers)
+    if submit_resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"RunPod job submission failed: {submit_resp.text}")
 
-    r = requests.post(RUNPOD_ENDPOINT, json=payload, headers=headers)
-    if r.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"RunPod error: {r.text}")
-
-    job_id = r.json().get("id")
+    job_id = submit_resp.json().get("id")
     if not job_id:
-        raise HTTPException(status_code=500, detail="RunPod did not return a job ID")
+        raise HTTPException(status_code=500, detail="No job ID returned from RunPod")
 
-    result = poll_runpod(job_id)
-    return result
+    # Poll until complete
+    status_url = f"{RUNPOD_ENDPOINT}/status/{job_id}"
+    while True:
+        status_resp = requests.get(status_url, headers=headers)
+        if status_resp.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"RunPod status check failed: {status_resp.text}")
 
-# ===== ROUTES =====
-@app.post("/batch", response_model=BatchResponse)
-async def generate_batch(template: str = Form(...), file: UploadFile = File(...)):
-    if template not in TEMPLATES:
-        raise HTTPException(status_code=400, detail="Invalid template name")
+        status_data = status_resp.json()
+        status = status_data.get("status")
+        if status == "COMPLETED":
+            output_urls = extract_urls(status_data)
+            return {
+                "template": template,
+                "prompt": prompt_text,
+                "images": output_urls
+            }
+        elif status == "FAILED":
+            raise HTTPException(status_code=500, detail="RunPod job failed")
 
-    # Save uploaded file
-    tmp_path = f"/tmp/{uuid.uuid4()}_{file.filename}"
-    with open(tmp_path, "wb") as f:
-        f.write(await file.read())
+        time.sleep(3)  # wait before polling again
 
-    base64_img = image_to_base64(tmp_path)
-    prompt = TEMPLATES[template]
+def build_workflow(prompt: str, img_b64: str, num_outputs: int):
+    """
+    Returns the workflow JSON with uploaded image composited into generated background.
+    - Uses hybrid composite method, no transformation of artwork.
+    - Generates multiple outputs in one job.
+    """
+    return {
+        "nodes": [
+            {"id": 0, "type": "LoadImage", "inputs": {"image": img_b64}},
+            {"id": 1, "type": "ImageScale", "inputs": {"width": 512, "height": 512, "keep_aspect": True, "image": "#0"}},
+            {"id": 2, "type": "PromptToLatent", "inputs": {"prompt": prompt}},
+            {"id": 3, "type": "LatentComposite", "inputs": {"background": "#2", "foreground": "#1", "x": 400, "y": 300}},
+            {"id": 4, "type": "LatentToImage", "inputs": {"latent": "#3", "num_outputs": num_outputs}}
+        ]
+    }
 
-    urls = []
-    for _ in range(5):  # 5 variations
-        result = runpod_request(prompt, base64_img)
-        try:
-            img_url = result.get("output", {}).get("image_url", None)
-            if img_url:
-                urls.append(img_url)
-            else:
-                urls.append("MISSING")
-        except Exception:
-            urls.append("MISSING")
-
-    return {"urls": urls}
-
-@app.get("/")
-def root():
-    return {"message": "Mockup API running"}
+def extract_urls(status_data):
+    """
+    Extracts image URLs from RunPod job result.
+    """
+    outputs = status_data.get("output", {}).get("images", [])
+    return [img.get("url") for img in outputs if img.get("url")]
