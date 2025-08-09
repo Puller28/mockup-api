@@ -6,8 +6,9 @@ from typing import List
 
 import requests
 from requests.adapters import HTTPAdapter
-from requests.exceptions import ChunkedEncodingError, ProtocolError, ConnectionError, ReadTimeout
+from requests.exceptions import ChunkedEncodingError, ConnectionError, ReadTimeout
 from urllib3.util.retry import Retry
+from urllib3.exceptions import ProtocolError  # <-- FIXED import
 
 from fastapi import FastAPI, UploadFile, Form, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +55,7 @@ def _build_session():
         total=5,
         backoff_factor=0.7,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
+        allowed_methods=frozenset(["GET", "POST"]),
         raise_on_status=False,
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
@@ -128,6 +129,7 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
     - {"output":{"images":[{"url":...},{"base64":...}]}}
     - {"output":{"image_url": "..."}}
     - {"output":{"urls":[...]}}
+    - {"output":{"base64":[...]}}
     """
     out = status_payload.get("output", {}) or {}
 
@@ -174,7 +176,6 @@ def build_comfyui_workflow(prompt: str, art_b64_no_prefix: str) -> dict:
       - Decode -> output
     """
     return {
-        # Classic ComfyUI graph format (dict of node ids -> node spec)
         "workflow": {
             "100": {  # checkpoint loader
                 "class_type": "CheckpointLoaderSimple",
@@ -308,11 +309,6 @@ async def batch(template: str = Form(...), file: UploadFile = File(...)):
         job_id = submit_run(payload)
         status = poll_status(job_id)
         outs = extract_images_from_output(status)
-        if not outs:
-            # Add a placeholder so array length stays consistent
-            images_all.append("MISSING")
-        else:
-            # pick the first per run (usually one per run)
-            images_all.append(outs[0])
+        images_all.append(outs[0] if outs else "MISSING")
 
     return BatchResponse(template=template, prompt=prompt_text, images=images_all)
