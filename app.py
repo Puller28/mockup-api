@@ -260,12 +260,13 @@ def build_comfyui_workflow(prompt: str, art_b64_no_prefix: str, seed: int) -> di
     # RunPod ComfyUI wrapper convention:
     # - graph is under "workflow"
     # - uploaded images are under top-level "images"
-    return {
+        return {
         "workflow": workflow_graph,
         "images": [
-            { "filename": "art.png", "data": art_b64_no_prefix }
+            { "name": "art.png", "image": art_b64_no_prefix }  # <- keys changed
         ]
     }
+
 
 # ========= ROUTES =========
 @app.get("/")
