@@ -187,15 +187,16 @@ def build_comfyui_workflow(prompt: str, art_image_data_url: str, seed: int) -> d
             "class_type": "LoadImage",
             "inputs": { "image": "art.png", "upload": True }
         },
-        "1": {  # Resize to framed size
-            "class_type": "ImageScale",
-            "inputs": {
-                "image": ["0", 0],
-                "width": 512,
-                "height": 512,
-                "upscale_method": "lanczos",
-                "keep_proportions": True
-            }
+"1": {  # Resize to framed size
+    "class_type": "ImageScale",
+    "inputs": {
+        "image": ["0", 0],
+        "width": 512,
+        "height": 512,
+        "upscale_method": "lanczos",
+        "keep_proportions": True,
+        "crop": False  # <-- REQUIRED by your worker
+    }
         },
         "2": {  # VAEEncode artwork
             "class_type": "VAEEncode",
