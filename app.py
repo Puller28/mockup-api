@@ -195,9 +195,9 @@ def build_comfyui_workflow(prompt: str, art_image_data_url: str, seed: int) -> d
         "height": 512,
         "upscale_method": "lanczos",
         "keep_proportions": True,
-        "crop": False  # <-- REQUIRED by your worker
+        "crop": "disabled"   # <-- was False; must be "disabled" or "center"
     }
-        },
+},
         "2": {  # VAEEncode artwork
             "class_type": "VAEEncode",
             "inputs": {
