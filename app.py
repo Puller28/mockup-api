@@ -1,330 +1,292 @@
 import os
 import io
+import gc
 import json
 import base64
-from typing import List
+import secrets
+from typing import List, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from PIL import Image, ImageOps, ImageDraw, ImageFilter, ImageChops
-
-# Optional: rembg for nicer subject edges (CPU OK on Render)
-try:
-    from rembg import remove
-    REMBG_AVAILABLE = True
-except Exception:
-    REMBG_AVAILABLE = False
-
+from PIL import Image, ImageOps, ImageFilter
+from rembg import remove, new_session
 import requests
-from requests.adapters import HTTPAdapter
-from requests.exceptions import ChunkedEncodingError, ConnectionError, ReadTimeout
-from urllib3.util.retry import Retry
-from urllib3.exceptions import ProtocolError
 
 
-# ========= ENV =========
-RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT")           # e.g. https://api.runpod.ai/v2/<endpoint_id>
-RUNPOD_API_KEY  = os.getenv("RUNPOD_API_KEY")
-CKPT_NAME       = os.getenv("CKPT_NAME", "flux1-dev-fp8.safetensors")
-TARGET_CANVAS   = int(os.getenv("MOCKUP_CANVAS", "768"))  # 768 is VRAM-friendly; you can set 1024
+# -------------------------
+# Environment
+# -------------------------
+RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
+RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT", "")  # e.g. https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync
 
-if not RUNPOD_ENDPOINT or not RUNPOD_API_KEY:
-    raise RuntimeError("Please set RUNPOD_ENDPOINT and RUNPOD_API_KEY environment variables.")
+# Keep RAM low on Hobbyist
+SESSION = new_session(model_name="u2netp")
 
+app = FastAPI(title="Mockup API (Mask + Outpaint)", version="1.1.0")
 
-# ========= FASTAPI =========
-app = FastAPI(title="Mockup Generator — Outpaint Around Art")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
-# ========= HTTP client (retries) =========
-def _build_session():
-    s = requests.Session()
-    retry = Retry(
-        total=5,
-        backoff_factor=0.7,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "POST"]),
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://", HTTPAdapter(max_retries=retry))
-    return s
+# -------------------------
+# Utilities
+# -------------------------
+def ensure_env():
+    if not RUNPOD_API_KEY or not RUNPOD_ENDPOINT:
+        raise HTTPException(status_code=500, detail="RunPod environment not configured")
 
-SESSION = _build_session()
+def pil_to_png_b64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def _headers():
-    return {
-        "Authorization": f"Bearer {RUNPOD_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept-Encoding": "identity",
-        "Connection": "close",
-    }
-
-
-# ========= Image helpers =========
-def _resize_square(img: Image.Image, side: int) -> Image.Image:
-    return ImageOps.contain(img, (side, side), method=Image.LANCZOS).resize((side, side), Image.LANCZOS)
-
-def _png_bytes(im: Image.Image) -> bytes:
-    b = io.BytesIO()
-    im.save(b, format="PNG")
-    return b.getvalue()
-
-def _b64_no_prefix(png_bytes: bytes) -> str:
-    return base64.b64encode(png_bytes).decode("utf-8")
-
-def _data_url_from_b64(s: str) -> str:
-    if s.startswith("http://") or s.startswith("https://") or s.startswith("data:image/"):
-        return s
-    return "data:image/png;base64," + s
-
-def _upscale_to_1024(img: Image.Image) -> Image.Image:
-    if img.width == 1024:
+def downscale(img: Image.Image, max_side: int = 1280) -> Image.Image:
+    w, h = img.size
+    if max(w, h) <= max_side:
         return img
-    return img.resize((1024, 1024), Image.LANCZOS)
+    scale = max_side / max(w, h)
+    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
+async def read_upload_image(file: UploadFile) -> Image.Image:
+    data = await file.read()
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read image")
+    return img
 
-# ========= Auto canvas + mask =========
-def build_canvas_and_mask(upload_bytes: bytes, side: int) -> tuple[bytes, bytes]:
+def make_background_alpha_mask(original_rgba: Image.Image) -> Image.Image:
     """
-    Returns:
-      - art.png  : square RGB canvas with your image (centered/fit)
-      - mask.png : RGBA where ALPHA=255 means "AI may paint here", ALPHA=0 = keep
-                   We make background paintable and protect the subject+near edges.
+    rembg produces a FOREGROUND mask (white = subject). Our Comfy rule needs
+    a BACKGROUND mask in the alpha channel (white = PAINT background, black = KEEP subject).
+    So we: downscale -> rembg only_mask -> invert -> gentle feather -> return RGBA with alpha.
     """
-    src = Image.open(io.BytesIO(upload_bytes)).convert("RGBA")
-    img = _resize_square(src, side)
+    # Work on smaller copy to reduce RAM, then scale mask back up
+    small = downscale(original_rgba, max_side=1280)
+    buf = io.BytesIO()
+    small.save(buf, format="PNG")
 
-    # Base canvas: neutral gray (avoid bias)
-    canvas = Image.new("RGB", (side, side), (128, 128, 128))
-    canvas.paste(img.convert("RGB"), (0, 0))
+    fg_bytes = remove(
+        buf.getvalue(),
+        session=SESSION,
+        only_mask=True,          # 8-bit mask
+        post_process_mask=True,  # cleaner edges
+    )
+    fg_mask_l = Image.open(io.BytesIO(fg_bytes)).convert("L")  # white = subject
 
-    # Default: protect entire image (alpha=0), paint nothing (alpha=0)
-    # We'll create a background mask (white/alpha=255) and keep subject area alpha=0.
-    if REMBG_AVAILABLE:
-        # Subject matte (255=subject, 0=bg)
-        matte_bytes = remove(_png_bytes(img), only_mask=True)
-        matte = Image.open(io.BytesIO(matte_bytes)).convert("L")
-        # Invert for background paint mask (white area = background)
-        bg_mask = ImageOps.invert(matte)
-        # Slight blur → softer seams
-        bg_mask = bg_mask.filter(ImageFilter.GaussianBlur(radius=1.0))
-    else:
-        # No rembg: paint only a thin border (so at least some outpaint happens)
-        bg_mask = Image.new("L", (side, side), 0)
-        draw = ImageDraw.Draw(bg_mask)
-        draw.rectangle([8, 8, side - 8, side - 8], outline=255, width=16)
+    # Invert -> white = background (PAINT), black = subject (KEEP)
+    bg_mask_l = ImageOps.invert(fg_mask_l)
 
-    # Build RGBA where alpha channel = bg_mask (Comfy: white/opaque = paint)
-    mask_rgba = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-    r = g = b = Image.new("L", (side, side), 0)
-    mask_rgba = Image.merge("RGBA", (r, g, b, bg_mask))
+    # Light feather to avoid seams at the inpaint boundary
+    bg_mask_l = bg_mask_l.filter(ImageFilter.GaussianBlur(radius=0.8))
 
-    return _png_bytes(canvas), _png_bytes(mask_rgba)
+    # Resize back to original size if we downscaled
+    if small.size != original_rgba.size:
+        bg_mask_l = bg_mask_l.resize(original_rgba.size, Image.LANCZOS)
 
+    # Place into alpha channel as required by LoadImageMask(channel="alpha")
+    mask_rgba = Image.new("RGBA", original_rgba.size, (0, 0, 0, 0))
+    mask_rgba.putalpha(bg_mask_l)
 
-# ========= ComfyUI workflow + call =========
-def build_inpaint_workflow(prompt: str, seed: int) -> dict:
+    # free
+    del small, buf, fg_mask_l, bg_mask_l
+    gc.collect()
+
+    return mask_rgba
+
+def html_gallery(items: List[Tuple[str, int]]) -> str:
+    imgs = "\n".join(
+        f"<figure style='margin:8px'><img style='width:300px;height:auto;display:block' src='data:image/png;base64,{b64}'/>"
+        f"<figcaption style='font:12px system-ui;color:#444'>seed {seed}</figcaption></figure>"
+        for b64, seed in items
+    )
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Generated mockups</title>
+</head>
+<body style="margin:24px;font-family:system-ui,-apple-system,Segoe UI,Roboto">
+  <h1 style="margin:0 0 12px">Generated mockups</h1>
+  <p style="margin:0 0 16px;color:#444">Quick preview</p>
+  <div style="display:flex;flex-wrap:wrap">{imgs}</div>
+</body>
+</html>"""
+
+def build_workflow(seed: int, prompt_text: str, negative_text: str = "blurry, artifacts, low quality, watermark, text") -> dict:
     """
-    ComfyUI graph:
-      LoadImage('art.png') + LoadImageMask('mask.png', channel='alpha')
-      -> VAEEncodeForInpaint(grow_mask_by=24)
-      -> KSampler(denoise=1.0, steps=18, cfg=5.5)
-      -> VAEDecode -> SaveImage
+    Your provided ComfyUI graph, parameterised for prompt and seed.
+    Note: we keep 'image' fields as filenames because we send an 'images' array alongside.
     """
     return {
-        "workflow": {
-            "100": {  # checkpoint
-                "class_type": "CheckpointLoaderSimple",
-                "inputs": {"ckpt_name": CKPT_NAME}
-            },
-            "pos": {  # positive prompt
-                "class_type": "CLIPTextEncode",
-                "inputs": {"clip": ["100", 1], "text": prompt}
-            },
-            "neg": {  # negative prompt
-                "class_type": "CLIPTextEncode",
-                "inputs": {"clip": ["100", 1], "text": "blurry, artifacts, low quality, watermark, text"}
-            },
-            "img": {  # your canvas
-                "class_type": "LoadImage",
-                "inputs": {"image": "art.png"}  # referenced by name via top-level `images`
-            },
-            "msk": {  # alpha mask (alpha=paint)
-                "class_type": "LoadImageMask",
-                "inputs": {"image": "mask.png", "channel": "alpha"}  # needs 'channel'
-            },
-            "enc": {  # encode for inpaint
-                "class_type": "VAEEncodeForInpaint",
-                "inputs": {"pixels": ["img", 0], "mask": ["msk", 0], "vae": ["100", 2], "grow_mask_by": 24}
-            },
-            "ks": {  # background generation only
-                "class_type": "KSampler",
-                "inputs": {
-                    "model": ["100", 0],
-                    "positive": ["pos", 0],
-                    "negative": ["neg", 0],
-                    "latent_image": ["enc", 0],
-                    "seed": seed,
-                    "steps": 18,
-                    "cfg": 5.5,
-                    "sampler_name": "euler",
-                    "scheduler": "normal",
-                    "denoise": 1.0
-                }
-            },
-            "dec": {  # decode to image
-                "class_type": "VAEDecode",
-                "inputs": {"samples": ["ks", 0], "vae": ["100", 2]}
-            },
-            "save": {  # save final
-                "class_type": "SaveImage",
-                "inputs": {"images": ["dec", 0], "filename_prefix": "mockup_out"}
+        # 3: Checkpoint/CLIP/VAE bundle
+        "3": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": { "ckpt_name": "flux1-dev-fp8.safetensors" }
+        },
+        # Positive / negative prompts encoded with CLIP from node 3
+        "10": {
+            "class_type": "CLIPTextEncode",
+            "inputs": { "clip": ["3", 1], "text": prompt_text }
+        },
+        "11": {
+            "class_type": "CLIPTextEncode",
+            "inputs": { "clip": ["3", 1], "text": negative_text }
+        },
+        # Load image and mask by name; we'll attach actual base64 images in payload
+        "1": { "class_type": "LoadImage", "inputs": { "image": "art.png" } },
+        "2": { "class_type": "LoadImageMask", "inputs": { "image": "mask.png", "channel": "alpha" } },
+        # Encode for inpaint using mask (white=paint)
+        "5": {
+            "class_type": "VAEEncodeForInpaint",
+            "inputs": { "pixels": ["1", 0], "mask": ["2", 0], "vae": ["3", 2], "grow_mask_by": 24 }
+        },
+        # Sampler with our seed
+        "6": {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["3", 0],
+                "positive": ["10", 0],
+                "negative": ["11", 0],
+                "latent_image": ["5", 0],
+                "seed": seed,
+                "steps": 18,
+                "cfg": 5.5,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 1.0
             }
-        }
+        },
+        # Decode and save
+        "7": { "class_type": "VAEDecode", "inputs": { "samples": ["6", 0], "vae": ["3", 2] } },
+        "8": { "class_type": "SaveImage", "inputs": { "images": ["7", 0], "filename_prefix": "mockup_out" } }
     }
 
-def call_runsync(payload: dict, timeout_sec: int = 420) -> dict:
-    url = f"{RUNPOD_ENDPOINT}/runsync"
-    try:
-        r = SESSION.post(url, json=payload, headers=_headers(), timeout=timeout_sec)
-    except (ChunkedEncodingError, ProtocolError, ConnectionError, ReadTimeout) as e:
-        raise HTTPException(status_code=502, detail=f"RunPod connect error: {e}")
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail={"runpod_runsync_error": r.text})
-    try:
-        return r.json()
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=502, detail={"runpod_runsync_error": "Invalid JSON from RunPod", "raw": r.text})
+def call_runpod_with_images(workflow: dict, art_b64: str, mask_b64: str, timeout: int = 120) -> List[str]:
+    """
+    Sends your workflow plus named images array to RunPod ComfyUI runsync endpoint.
+    """
+    ensure_env()
 
-def extract_images_from_output(status_payload: dict) -> List[str]:
-    out = (status_payload or {}).get("output") or {}
-    results: List[str] = []
-
-    imgs = out.get("images")
-    if isinstance(imgs, list):
-        for it in imgs:
-            # common shapes: {"base64": "..."} or {"content":"..."} or {"url":"..."}
-            if isinstance(it, dict):
-                if it.get("base64"): results.append(_data_url_from_b64(it["base64"]))
-                elif it.get("content"): results.append(_data_url_from_b64(it["content"]))
-                elif it.get("url"): results.append(it["url"])
-                elif it.get("data"): results.append(_data_url_from_b64(it["data"]))
-            elif isinstance(it, str):
-                results.append(_data_url_from_b64(it))
-    if results:
-        return results
-
-    urls = out.get("urls")
-    if isinstance(urls, list) and urls:
-        return urls
-
-    b64s = out.get("base64")
-    if isinstance(b64s, list) and b64s:
-        return [_data_url_from_b64(b) for b in b64s if isinstance(b, str) and b]
-
-    if isinstance(out.get("image_url"), str) and out["image_url"]:
-        return [out["image_url"]]
-
-    if isinstance(out.get("image_path"), str) and out["image_path"]:
-        return [out["image_path"]]
-
-    return []
-
-
-# ========= Core generator (used by both JSON + HTML routes) =========
-def generate_variations(upload_bytes: bytes, prompt: str, n: int = 5) -> List[str]:
-    # Build canvas + mask (square)
-    art_png, mask_png = build_canvas_and_mask(upload_bytes, TARGET_CANVAS)
-    art_b64 = _b64_no_prefix(art_png)
-    mask_b64 = _b64_no_prefix(mask_png)
-
-    images_all: List[str] = []
-    for i in range(n):
-        wf = build_inpaint_workflow(prompt, seed=123456 + i)
-
-        payload = {
-            "input": {
-                "return_type": "base64",
-                **wf,
-                # IMPORTANT: RunPod ComfyUI wrapper expects uploaded files here
-                "images": [
-                    {"name": "art.png", "image": art_b64},
-                    {"name": "mask.png", "image": mask_b64},
-                ]
-            }
+    payload = {
+        "input": {
+            "return_type": "base64",
+            "workflow": workflow,
+            "images": [
+                {"name": "art.png",  "image": art_b64},
+                {"name": "mask.png", "image": mask_b64}
+            ]
         }
-
-        result = call_runsync(payload, timeout_sec=480)
-        if i == 0:
-            try:
-                print("RUNPOD_RAW_SAMPLE:", json.dumps(result)[:4000])
-            except Exception:
-                print("RUNPOD_RAW_SAMPLE:<non-serializable>")
-
-        outs = extract_images_from_output(result)
-        if not outs:
-            images_all.append("MISSING")
-            continue
-
-        # If we generated at 768, upscale for display parity (optional)
-        try:
-            if outs[0].startswith("data:image/"):
-                b64 = outs[0].split(",", 1)[1]
-                im = Image.open(io.BytesIO(base64.b64decode(b64)))
-                im = _upscale_to_1024(im)
-                buf = io.BytesIO()
-                im.save(buf, format="PNG")
-                images_all.append("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8"))
-            else:
-                images_all.append(outs[0])
-        except Exception:
-            images_all.append(outs[0])
-
-    return images_all
-
-
-# ========= Routes =========
-@app.get("/")
-def root():
-    return {
-        "message": "Mockup API (outpainting around uploaded art)",
-        "rembg_enabled": REMBG_AVAILABLE,
-        "canvas": TARGET_CANVAS,
-        "routes": [r.path for r in app.routes],
     }
+    headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
 
-@app.get("/try", response_class=HTMLResponse)
-def try_form():
+    try:
+        resp = requests.post(RUNPOD_ENDPOINT, headers=headers, json=payload, timeout=timeout)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Error calling RunPod: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"RunPod error: {resp.text}")
+
+    data = resp.json()
+    images = data.get("output", {}).get("images", [])
+    if not images:
+        images = [{"image": im} for im in data.get("output", [])]
+
+    b64_list = [im.get("image") for im in images if isinstance(im, dict) and "image" in im]
+    if not b64_list:
+        raise HTTPException(status_code=502, detail="RunPod returned no images")
+
+    return b64_list
+
+
+# -------------------------
+# Routes
+# -------------------------
+@app.get("/", response_class=HTMLResponse)
+def index():
+    # Simple form for manual tests
     return """
-    <h2>Mockup Outpainting — Quick Test</h2>
-    <form action="/batch/html" method="post" enctype="multipart/form-data">
-      <label>Prompt:</label><br/>
-      <input name="prompt" size="80" value="Framed artwork on a cozy bedroom wall, soft window light, realistic shadows, photorealistic interior" />
-      <br/><br/>
-      <input type="file" name="file" accept="image/*" required />
-      <br/><br/>
-      <button type="submit">Generate (5 variations)</button>
-    </form>
+<!doctype html>
+<html>
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
+<body style="margin:24px;font-family:system-ui,-apple-system,Segoe UI,Roboto">
+  <h1>Mask + Outpaint</h1>
+  <form action="/batch/html" method="post" enctype="multipart/form-data" style="display:grid;gap:8px;max-width:520px">
+    <input type="file" name="file" accept="image/*" required />
+    <input type="text" name="prompt" placeholder="Describe the room/background…" required />
+    <input type="text" name="negative" placeholder="Optional negative prompt" />
+    <input type="number" name="count" min="1" max="5" value="1" />
+    <button type="submit">Generate</button>
+  </form>
+  <p style="color:#666">Programmatic endpoint: <code>/batch/json</code></p>
+</body>
+</html>
+""".strip()
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.post("/batch/json")
+async def batch_json(
+    file: UploadFile = File(...),
+    prompt: str = Form(...),
+    negative: str = Form("blurry, artifacts, low quality, watermark, text"),
+    count: int = Form(1)
+):
     """
+    Generate 1 image by default. Increase 'count' up to 5 when stable.
+    """
+    count = max(1, min(5, int(count)))
 
-@app.post("/batch")
-async def batch(prompt: str = Form(...), file: UploadFile = File(...)):
-    raw = await file.read()
-    imgs = generate_variations(raw, prompt, n=5)
-    return JSONResponse({"status": "ok", "images": imgs})
+    # Read input image
+    original = await read_upload_image(file)  # RGBA expected
 
-@app.post("/batch/html")
-async def batch_html(prompt: str = Form(...), file: UploadFile = File(...)):
-    raw = await file.read()
-    imgs = generate_variations(raw, prompt, n=5)
-    html = [f"<h3>Prompt</h3><p>{prompt}</p><hr/>"]
-    for i, src in enumerate(imgs, 1):
-        html.append(f"<div style='margin:10px 0'><b>{i}</b><br/><img style='max-width:640px' src='{src}'/></div>")
-    return Response("\n".join(html), media_type="text/html")
+    # Build background mask in alpha channel (white=paint, black=keep)
+    mask_rgba = make_background_alpha_mask(original)
+
+    # Encode for RunPod images array
+    art_b64 = pil_to_png_b64(original)
+    mask_b64 = pil_to_png_b64(mask_rgba)
+
+    # Free heavy objects as soon as possible
+    del mask_rgba
+    gc.collect()
+
+    results = []
+    for _ in range(count):
+        seed = secrets.randbits(32)
+        wf = build_workflow(seed=seed, prompt_text=prompt, negative_text=negative)
+        imgs = call_runpod_with_images(wf, art_b64=art_b64, mask_b64=mask_b64)
+        results.append({"seed": seed, "image_b64": imgs[0]})
+
+    # Clean up
+    del original, art_b64, mask_b64
+    gc.collect()
+
+    return JSONResponse({"count": len(results), "results": results})
+
+@app.post("/batch/html", response_class=HTMLResponse)
+async def batch_html(
+    file: UploadFile = File(...),
+    prompt: str = Form(...),
+    negative: str = Form("blurry, artifacts, low quality, watermark, text"),
+    count: int = Form(1)
+):
+    data = await batch_json(file=file, prompt=prompt, negative=negative, count=count)
+    payload = json.loads(data.body.decode("utf-8"))
+    items = [(r["image_b64"], r["seed"]) for r in payload["results"]]
+    return HTMLResponse(content=html_gallery(items), status_code=200)
+
+
+# Local dev
+if __name__ == "__main__":
+    import uvicorn
+    # One worker on Hobbyist; no reload in prod
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
