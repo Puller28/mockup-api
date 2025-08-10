@@ -2,6 +2,7 @@ import os
 import io
 import json
 import base64
+from PIL import Image, ImageOps, ImageDraw, ImageFilter, ImageChops
 from typing import List, Dict, Tuple
 
 from PIL import Image, ImageOps, ImageDraw, ImageFilter
