@@ -29,7 +29,7 @@ def get_session():
         SESSION = new_session(model_name="u2netp")
     return SESSION
 
-app = FastAPI(title="Mockup API (Mask + Outpaint)", version="1.1.1")
+app = FastAPI(title="Mockup API (Mask + Outpaint)", version="1.1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,8 +68,8 @@ async def read_upload_image(file: UploadFile) -> Image.Image:
 
 def make_background_alpha_mask(original_rgba: Image.Image) -> Image.Image:
     """
-    rembg produces a FOREGROUND mask (white = subject). Our Comfy rule needs
-    a BACKGROUND mask in the alpha channel (white = PAINT background, black = KEEP subject).
+    rembg gives a FOREGROUND mask (white = subject). Comfy needs a BACKGROUND mask in alpha
+    where white = PAINT background and black = KEEP subject.
     Steps: downscale -> rembg only_mask -> invert -> gentle feather -> return RGBA with alpha.
     """
     # Work on smaller copy to reduce RAM, then scale mask back up
@@ -214,13 +214,17 @@ def index():
 </html>
 """.strip()
 
+# Render's probe sometimes sends HEAD /. Return 200 so port check passes.
+@app.head("/")
+def index_head():
+    return HTMLResponse(content="", status_code=200)
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
 @app.get("/ready")
 def ready():
-    # useful to ping right after deploy
     return {"ok": True}
 
 @app.post("/batch/json")
