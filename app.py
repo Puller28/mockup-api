@@ -20,10 +20,16 @@ import requests
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT", "")  # e.g. https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync
 
-# Keep RAM low on Hobbyist
-SESSION = new_session(model_name="u2netp")
+# Lazy rembg session so the server binds to $PORT immediately
+SESSION = None
+def get_session():
+    global SESSION
+    if SESSION is None:
+        # tiny model for low RAM on Render Hobbyist
+        SESSION = new_session(model_name="u2netp")
+    return SESSION
 
-app = FastAPI(title="Mockup API (Mask + Outpaint)", version="1.1.0")
+app = FastAPI(title="Mockup API (Mask + Outpaint)", version="1.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +70,7 @@ def make_background_alpha_mask(original_rgba: Image.Image) -> Image.Image:
     """
     rembg produces a FOREGROUND mask (white = subject). Our Comfy rule needs
     a BACKGROUND mask in the alpha channel (white = PAINT background, black = KEEP subject).
-    So we: downscale -> rembg only_mask -> invert -> gentle feather -> return RGBA with alpha.
+    Steps: downscale -> rembg only_mask -> invert -> gentle feather -> return RGBA with alpha.
     """
     # Work on smaller copy to reduce RAM, then scale mask back up
     small = downscale(original_rgba, max_side=1280)
@@ -73,7 +79,7 @@ def make_background_alpha_mask(original_rgba: Image.Image) -> Image.Image:
 
     fg_bytes = remove(
         buf.getvalue(),
-        session=SESSION,
+        session=get_session(),   # lazy initialisation
         only_mask=True,          # 8-bit mask
         post_process_mask=True,  # cleaner edges
     )
@@ -120,51 +126,30 @@ def html_gallery(items: List[Tuple[str, int]]) -> str:
 
 def build_workflow(seed: int, prompt_text: str, negative_text: str = "blurry, artifacts, low quality, watermark, text") -> dict:
     """
-    Your provided ComfyUI graph, parameterised for prompt and seed.
-    Note: we keep 'image' fields as filenames because we send an 'images' array alongside.
+    Your ComfyUI graph, parameterised for prompt and seed.
+    We keep 'image' fields as filenames because we send an 'images' array alongside.
     """
     return {
-        # 3: Checkpoint/CLIP/VAE bundle
-        "3": {
-            "class_type": "CheckpointLoaderSimple",
-            "inputs": { "ckpt_name": "flux1-dev-fp8.safetensors" }
-        },
-        # Positive / negative prompts encoded with CLIP from node 3
-        "10": {
-            "class_type": "CLIPTextEncode",
-            "inputs": { "clip": ["3", 1], "text": prompt_text }
-        },
-        "11": {
-            "class_type": "CLIPTextEncode",
-            "inputs": { "clip": ["3", 1], "text": negative_text }
-        },
-        # Load image and mask by name; we'll attach actual base64 images in payload
-        "1": { "class_type": "LoadImage", "inputs": { "image": "art.png" } },
-        "2": { "class_type": "LoadImageMask", "inputs": { "image": "mask.png", "channel": "alpha" } },
-        # Encode for inpaint using mask (white=paint)
-        "5": {
-            "class_type": "VAEEncodeForInpaint",
-            "inputs": { "pixels": ["1", 0], "mask": ["2", 0], "vae": ["3", 2], "grow_mask_by": 24 }
-        },
-        # Sampler with our seed
-        "6": {
-            "class_type": "KSampler",
-            "inputs": {
-                "model": ["3", 0],
-                "positive": ["10", 0],
-                "negative": ["11", 0],
-                "latent_image": ["5", 0],
-                "seed": seed,
-                "steps": 18,
-                "cfg": 5.5,
-                "sampler_name": "euler",
-                "scheduler": "normal",
-                "denoise": 1.0
-            }
-        },
-        # Decode and save
-        "7": { "class_type": "VAEDecode", "inputs": { "samples": ["6", 0], "vae": ["3", 2] } },
-        "8": { "class_type": "SaveImage", "inputs": { "images": ["7", 0], "filename_prefix": "mockup_out" } }
+        "3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "flux1-dev-fp8.safetensors"}},
+        "10": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": prompt_text}},
+        "11": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": negative_text}},
+        "1": {"class_type": "LoadImage", "inputs": {"image": "art.png"}},
+        "2": {"class_type": "LoadImageMask", "inputs": {"image": "mask.png", "channel": "alpha"}},
+        "5": {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["1", 0], "mask": ["2", 0], "vae": ["3", 2], "grow_mask_by": 24}},
+        "6": {"class_type": "KSampler", "inputs": {
+            "model": ["3", 0],
+            "positive": ["10", 0],
+            "negative": ["11", 0],
+            "latent_image": ["5", 0],
+            "seed": seed,
+            "steps": 18,
+            "cfg": 5.5,
+            "sampler_name": "euler",
+            "scheduler": "normal",
+            "denoise": 1.0
+        }},
+        "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["3", 2]}},
+        "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "mockup_out"}}
     }
 
 def call_runpod_with_images(workflow: dict, art_b64: str, mask_b64: str, timeout: int = 120) -> List[str]:
@@ -231,6 +216,11 @@ def index():
 
 @app.get("/healthz")
 def healthz():
+    return {"ok": True}
+
+@app.get("/ready")
+def ready():
+    # useful to ping right after deploy
     return {"ok": True}
 
 @app.post("/batch/json")
