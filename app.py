@@ -220,12 +220,13 @@ def build_outpaint_workflow(prompt: str, neg: str, seed: int,
         "10": { "class_type": "LoadImage", "inputs": {"image": "init.png", "upload": True} },
         "11": { "class_type": "LoadImage", "inputs": {"image": "mask.png", "upload": True} },
         "11m": {  # convert IMAGE -> MASK
-            "class_type": "ImageToMask",
-            "inputs": {
-                "image": ["11", 0],
-                "channel": "luminance"   # REQUIRED by your worker
-            }
-        },
+    "class_type": "ImageToMask",
+    "inputs": {
+        "image": ["11", 0],
+        "channel": "red"   # was "luminance"; allowed: red|green|blue|alpha
+    }
+},
+
 
         # Encode for inpaint (requires MASK + grow_mask_by)
         "12": {
