@@ -200,33 +200,40 @@ def build_outpaint_workflow(prompt: str, neg: str, seed: int,
                             init_b64_png: str, mask_b64_png: str) -> dict:
     """
     Uses VAEEncodeForInpaint so the model paints ONLY outside the protected art.
+    - Convert mask IMAGE -> MASK via ImageToMask
+    - Provide grow_mask_by as required by your worker
     """
     workflow = {
         "100": {  # Model
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": DEFAULT_CKPT}
         },
-        "3": {    # Positive
-            "class_type": "CLIPTextEncode",
-            "inputs": {"clip": ["100", 1], "text": prompt}
+
+        # Text conditioning
+        "3": { "class_type": "CLIPTextEncode", "inputs": {"clip": ["100", 1], "text": prompt} },
+        "4": { "class_type": "CLIPTextEncode", "inputs": {"clip": ["100", 1], "text": neg} },
+
+        # Init canvas (art centered) and mask
+        "10": { "class_type": "LoadImage", "inputs": {"image": "init.png", "upload": True} },
+        "11": { "class_type": "LoadImage", "inputs": {"image": "mask.png", "upload": True} },
+        "11m": {  # <-- convert IMAGE to MASK
+            "class_type": "ImageToMask",
+            "inputs": { "image": ["11", 0] }
         },
-        "4": {    # Negative
-            "class_type": "CLIPTextEncode",
-            "inputs": {"clip": ["100", 1], "text": neg}
-        },
-        "10": {   # Init canvas (art centered)
-            "class_type": "LoadImage",
-            "inputs": {"image": "init.png", "upload": True}
-        },
-        "11": {   # Mask: white=paint, black=keep
-            "class_type": "LoadImage",
-            "inputs": {"image": "mask.png", "upload": True}
-        },
-        "12": {   # Encode with mask for inpainting
+
+        # Encode for inpaint (MASK type + required grow_mask_by)
+        "12": {
             "class_type": "VAEEncodeForInpaint",
-            "inputs": {"pixels": ["10", 0], "mask": ["11", 0], "vae": ["100", 2]}
+            "inputs": {
+                "pixels": ["10", 0],
+                "mask": ["11m", 0],      # MASK, not IMAGE
+                "grow_mask_by": 8,       # required by your worker; adjust 4–16 for stronger protection
+                "vae": ["100", 2]
+            }
         },
-        "13": {   # KSampler paints ONLY outside mask
+
+        # KSampler paints ONLY outside mask
+        "13": {
             "class_type": "KSampler",
             "inputs": {
                 "model": ["100", 0],
@@ -241,24 +248,20 @@ def build_outpaint_workflow(prompt: str, neg: str, seed: int,
                 "denoise": 0.70
             }
         },
-        "18": {   # Decode
-            "class_type": "VAEDecode",
-            "inputs": {"samples": ["13", 0], "vae": ["100", 2]}
-        },
-        "19": {   # Save
-            "class_type": "SaveImage",
-            "inputs": {"images": ["18", 0], "filename_prefix": "outpainted_mockup"}
-        }
+
+        # Decode and save
+        "18": { "class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["100", 2]} },
+        "19": { "class_type": "SaveImage", "inputs": {"images": ["18", 0], "filename_prefix": "outpainted_mockup"} }
     }
 
     return {
         "workflow": workflow,
-        # RunPod ComfyUI wrapper expects images array with {name, image}
         "images": [
             {"name": "init.png", "image": "data:image/png;base64," + init_b64_png},
-            {"name": "mask.png", "image": "data:image/png;base64," + mask_b64_png},
+            {"name": "mask.png", "image": "data:image/png;base64," + mask_b64_png}
         ]
     }
+
 
 # ================== ROUTES ==================
 @app.get("/")
