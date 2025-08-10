@@ -1,10 +1,18 @@
 import os
 import io
-import base64
 import json
+import base64
 from typing import List, Dict, Tuple
 
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageFilter
+
+# rembg for optional subject-edge refinement (CPU ok on Render)
+# If rembg is not available, code still runs (falls back to crisp rect mask).
+try:
+    from rembg import remove
+    REMBG_AVAILABLE = True
+except Exception:
+    REMBG_AVAILABLE = False
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,6 +22,7 @@ from urllib3.exceptions import ProtocolError
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # =========================
@@ -28,8 +37,8 @@ if not RUNPOD_API_KEY or not RUNPOD_ENDPOINT:
 
 # =========================
 # TEMPLATE DEFINITIONS
-# Canvas is 1024x1024. Place the framed art at (x,y,w,h).
-# Tune the rects to taste per template.
+# Canvas is 1024x1024. We place the framed art at (x,y,w,h).
+# Tweak these rects to your taste per template; they’re consistent and require no user input.
 # =========================
 TEMPLATES: Dict[str, Dict] = {
     "bedroom": {
@@ -70,7 +79,8 @@ TEMPLATES: Dict[str, Dict] = {
 }
 
 NEGATIVE_PROMPT = (
-    "blurry, low detail, distorted, bad framing, artifacts, low quality, overexposed, underexposed"
+    "blurry, low detail, distorted, bad framing, artifacts, low quality, overexposed, underexposed, "
+    "warped perspective, extra objects, text, watermark, logo"
 )
 
 # =========================
@@ -102,7 +112,7 @@ def _headers():
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="Mockup Generator (Outpaint Around Art)")
+app = FastAPI(title="Mockup Generator — Outpaint Around Uploaded Art")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -112,7 +122,7 @@ app.add_middleware(
 class BatchResponse(BaseModel):
     template: str
     prompt: str
-    images: List[str]  # data URLs (PNG)
+    images: List[str]  # data URLs (PNG) or HTTP URLs
 
 # =========================
 # Image utils
@@ -120,7 +130,7 @@ class BatchResponse(BaseModel):
 CANVAS_SIZE = (1024, 1024)
 
 def _resize_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Resize img to fit inside (target_w,target_h) keeping aspect (letterbox if needed)."""
+    """Resize image to fit inside (target_w, target_h) preserving aspect ratio."""
     return ImageOps.contain(img, (target_w, target_h), method=Image.LANCZOS)
 
 def _png_bytes(im: Image.Image) -> bytes:
@@ -128,44 +138,84 @@ def _png_bytes(im: Image.Image) -> bytes:
     im.save(buf, format="PNG")
     return buf.getvalue()
 
-def _to_data_url(png_bytes: bytes) -> str:
-    return "data:image/png;base64," + base64.b64encode(png_bytes).decode("utf-8")
+def _b64_no_prefix(png_bytes: bytes) -> str:
+    return base64.b64encode(png_bytes).decode("utf-8")
 
-def _compose_art_and_mask(upload_bytes: bytes, rect: Tuple[int, int, int, int]) -> Tuple[bytes, bytes]:
+def _to_data_url(b64_or_url: str) -> str:
+    if b64_or_url.startswith("http://") or b64_or_url.startswith("https://"):
+        return b64_or_url
+    if b64_or_url.startswith("data:image/"):
+        return b64_or_url
+    return "data:image/png;base64," + b64_or_url
+
+def _auto_compose_with_mask(upload_bytes: bytes, rect: Tuple[int, int, int, int]) -> Tuple[bytes, bytes]:
     """
-    Build:
-      - art_canvas.png  (art pasted into the fixed frame rectangle on a neutral 1024x1024)
-      - mask.png        (black = keep art; white = generate background)
-    Returns the PNG bytes for both.
+    Build two PNGs (bytes):
+      - art.png  : 1024x1024 RGB canvas with the uploaded art sized+placed into rect.
+      - mask.png : 1024x1024 RGBA where ALPHA channel is the mask for ComfyUI:
+                   alpha=0 over the protected artwork region (keep), alpha=255 elsewhere (paint).
+    Optionally refines edges using rembg (if available).
     """
     x, y, w, h = rect
 
     # Load upload
-    art = Image.open(io.BytesIO(upload_bytes)).convert("RGB")
-    art_resized = _resize_fit(art, w, h)
+    art_src = Image.open(io.BytesIO(upload_bytes)).convert("RGB")
+    art_fitted = _resize_fit(art_src, w, h)
 
-    # Create blank canvas (neutral gray)
-    canvas = Image.new("RGB", CANVAS_SIZE, (128, 128, 128))
-    # Center letterbox within rect if art_resized doesn't fill w×h exactly
-    paste_x = x + (w - art_resized.width) // 2
-    paste_y = y + (h - art_resized.height) // 2
-    canvas.paste(art_resized, (paste_x, paste_y))
+    # Base canvas (neutral mid-gray to avoid bias)
+    base = Image.new("RGB", CANVAS_SIZE, (128, 128, 128))
+    paste_x = x + (w - art_fitted.width) // 2
+    paste_y = y + (h - art_fitted.height) // 2
+    base.paste(art_fitted, (paste_x, paste_y))
 
-    # Make mask: black over the EXACT rect area where art could live, white elsewhere
-    # (We preserve the entire rect region strictly; background is generated outside it.)
-    mask = Image.new("L", CANVAS_SIZE, 255)  # white = inpaint/generate
-    draw = ImageDraw.Draw(mask)
-    draw.rectangle([x, y, x + w, y + h], fill=0)  # black = keep
+    # Start mask as a clean rectangle: alpha 0 over entire frame rect; 255 elsewhere
+    mask_alpha = Image.new("L", CANVAS_SIZE, 255)
+    draw = ImageDraw.Draw(mask_alpha)
+    draw.rectangle([x, y, x + w, y + h], fill=0)
 
-    return _png_bytes(canvas), _png_bytes(mask.convert("RGB"))
+    # OPTIONAL: refine edges with rembg — make the "keep" (alpha=0) follow the subject edges
+    # (We run rembg on the uploaded image only, resize its matte to where the art was pasted)
+    if REMBG_AVAILABLE:
+        try:
+            rgba = Image.open(io.BytesIO(remove(upload_bytes))).convert("RGBA")
+            matte = rgba.split()[-1]  # subject alpha: 255 on subject, 0 background
+            matte = _resize_fit(matte, art_fitted.width, art_fitted.height)  # match displayed size
+            # Place matte where art sits on canvas
+            matte_canvas = Image.new("L", CANVAS_SIZE, 0)
+            matte_canvas.paste(matte, (paste_x, paste_y))
+            # Invert: we want alpha=0 over subject/rect, 255 elsewhere
+            matte_inverted = ImageOps.invert(matte_canvas)
+            # Fuse with rect keep area: ensure the entire rect stays protected (black/alpha=0)
+            # (i.e., take the MIN between rect-black(0) and inverted matte)
+            mask_alpha = ImageChops.lighter(mask_alpha, matte_inverted)
+            # Feather seams slightly
+            mask_alpha = mask_alpha.filter(ImageFilter.GaussianBlur(radius=1.0))
+        except Exception:
+            # If rembg fails for any reason, just keep the rectangular mask
+            pass
+
+    # Build RGBA mask image with alpha channel = mask_alpha
+    mask_rgba = Image.new("RGBA", CANVAS_SIZE, (0, 0, 0, 0))
+    r = g = b = Image.new("L", CANVAS_SIZE, 0)
+    mask_rgba = Image.merge("RGBA", (r, g, b, mask_alpha))
+
+    return _png_bytes(base), _png_bytes(mask_rgba)
 
 # =========================
-# RunPod calls
+# RunPod / ComfyUI wiring
 # =========================
+def _session_headers():
+    return {
+        "Authorization": f"Bearer {RUNPOD_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+    }
+
 def call_runsync(payload: dict, timeout_sec: int = 420) -> dict:
     url = f"{RUNPOD_ENDPOINT}/runsync"
     try:
-        r = SESSION.post(url, json=payload, headers=_headers(), timeout=timeout_sec)
+        r = SESSION.post(url, json=payload, headers=_session_headers(), timeout=timeout_sec)
     except (ChunkedEncodingError, ProtocolError, ConnectionError, ReadTimeout) as e:
         raise HTTPException(status_code=502, detail=f"RunPod connect error: {e}")
     if r.status_code >= 400:
@@ -176,7 +226,6 @@ def call_runsync(payload: dict, timeout_sec: int = 420) -> dict:
         raise HTTPException(status_code=502, detail={"runpod_runsync_error": "Invalid JSON from RunPod", "raw": r.text})
 
 def extract_images_from_output(status_payload: dict) -> List[str]:
-    """Normalize image outputs (prefer base64 or urls). Returns data URLs if base64 is present."""
     out = (status_payload or {}).get("output") or {}
     results: List[str] = []
 
@@ -185,20 +234,17 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
         for it in imgs:
             if isinstance(it, dict):
                 if it.get("base64"):
-                    results.append("data:image/png;base64," + it["base64"])
+                    results.append(_to_data_url(it["base64"]))
                 elif it.get("content"):
-                    results.append("data:image/png;base64," + it["content"])
+                    results.append(_to_data_url(it["content"]))
                 elif it.get("url"):
                     results.append(it["url"])
-                elif it.get("path"):
-                    results.append(it["path"])
+                elif it.get("data"):
+                    results.append(_to_data_url(it["data"]))
             elif isinstance(it, str):
-                if it.startswith("http"):
-                    results.append(it)
-                else:
-                    results.append("data:image/png;base64," + it)
-    if results:
-        return results
+                results.append(_to_data_url(it))
+        if results:
+            return results
 
     urls = out.get("urls")
     if isinstance(urls, list) and urls:
@@ -206,7 +252,7 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
 
     b64s = out.get("base64")
     if isinstance(b64s, list) and b64s:
-        return ["data:image/png;base64," + b for b in b64s if isinstance(b, str) and b]
+        return [_to_data_url(b) for b in b64s if isinstance(b, str) and b]
 
     if isinstance(out.get("image_url"), str) and out["image_url"]:
         return [out["image_url"]]
@@ -218,10 +264,10 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
 
 def build_inpaint_workflow(prompt: str, seed: int) -> dict:
     """
-    ComfyUI graph (no transformation of artwork):
-      LoadImage('art.png') + LoadImageMask('mask.png')
-      -> VAEEncodeForInpaint (grow_mask_by=24)
-      -> KSampler (denoise=1.0)
+    ComfyUI graph (outpaint around uploaded art):
+      LoadImage('art.png') + LoadImageMask('mask.png', channel='alpha')
+      -> VAEEncodeForInpaint(grow_mask_by=24)
+      -> KSampler(denoise=1.0)
       -> VAEDecode -> SaveImage
     """
     return {
@@ -238,19 +284,19 @@ def build_inpaint_workflow(prompt: str, seed: int) -> dict:
                 "class_type": "CLIPTextEncode",
                 "inputs": {"clip": ["100", 1], "text": NEGATIVE_PROMPT}
             },
-            "img": {  # load composed canvas with art
+            "img": {  # the composed canvas with art
                 "class_type": "LoadImage",
                 "inputs": {"image": "art.png"}
             },
-            "msk": {  # load mask (black keep, white generate)
+            "msk": {  # the alpha mask (alpha=0 keep, alpha=255 paint)
                 "class_type": "LoadImageMask",
-                "inputs": {"image": "mask.png"}
+                "inputs": {"image": "mask.png", "channel": "alpha"}
             },
             "enc": {  # encode for inpaint
                 "class_type": "VAEEncodeForInpaint",
                 "inputs": {"pixels": ["img", 0], "mask": ["msk", 0], "vae": ["100", 2], "grow_mask_by": 24}
             },
-            "ks": {  # background generation only
+            "ks": {  # generate background only
                 "class_type": "KSampler",
                 "inputs": {
                     "model": ["100", 0],
@@ -259,7 +305,7 @@ def build_inpaint_workflow(prompt: str, seed: int) -> dict:
                     "latent_image": ["enc", 0],
                     "seed": seed,
                     "steps": 28,
-                    "cfg": 6.5,
+                    "cfg": 6.0,
                     "sampler_name": "euler",
                     "scheduler": "normal",
                     "denoise": 1.0
@@ -269,7 +315,7 @@ def build_inpaint_workflow(prompt: str, seed: int) -> dict:
                 "class_type": "VAEDecode",
                 "inputs": {"samples": ["ks", 0], "vae": ["100", 2]}
             },
-            "save": {  # save final
+            "save": {  # final image
                 "class_type": "SaveImage",
                 "inputs": {"images": ["dec", 0], "filename_prefix": "mockup_out"}
             }
@@ -281,45 +327,67 @@ def build_inpaint_workflow(prompt: str, seed: int) -> dict:
 # =========================
 @app.get("/")
 def root():
-    return {"message": "Mockup API ready", "templates": list(TEMPLATES.keys())}
+    return {"message": "Mockup API — outpainting around uploaded art", "templates": list(TEMPLATES.keys()),
+            "rembg_enabled": REMBG_AVAILABLE}
 
-@app.post("/batch", response_model=BatchResponse)
+@app.get("/try", response_class=HTMLResponse)
+def try_form():
+    return """
+    <h2>Mockup Outpainting (POST to /batch or /batch/html)</h2>
+    <form action="/batch/html" method="post" enctype="multipart/form-data">
+      <label>Template:
+        <select name="template">
+          <option>bedroom</option>
+          <option>gallery_wall</option>
+          <option>modern_lounge</option>
+          <option>rustic_study</option>
+          <option>kitchen</option>
+        </select>
+      </label>
+      <br/><br/>
+      <input type="file" name="file" accept="image/*" required />
+      <br/><br/>
+      <button type="submit">Generate (5 variations)</button>
+    </form>
+    """
+
+class BatchResponseModel(BaseModel):
+    template: str
+    prompt: str
+    images: List[str]
+
+@app.post("/batch", response_model=BatchResponseModel)
 async def batch(template: str = Form(...), file: UploadFile = File(...)):
-    """Return 5 mockups as data URLs (PNG)."""
     if template not in TEMPLATES:
         raise HTTPException(status_code=400, detail=f"Invalid template. Options: {list(TEMPLATES.keys())}")
 
     rect = tuple(TEMPLATES[template]["rect"])
     prompt_text = TEMPLATES[template]["prompt"]
 
-    # read upload
     raw = await file.read()
 
-    # compose canvas + mask
-    art_png, mask_png = _compose_art_and_mask(raw, rect)
-    art_b64 = base64.b64encode(art_png).decode("utf-8")
-    mask_b64 = base64.b64encode(mask_png).decode("utf-8")
+    # Compose art on canvas + auto-mask
+    art_png, mask_png = _auto_compose_with_mask(raw, rect)
+    art_b64 = _b64_no_prefix(art_png)
+    mask_b64 = _b64_no_prefix(mask_png)
 
     images_all: List[str] = []
     for i in range(5):
-        # build workflow for this seed
         wf = build_inpaint_workflow(prompt_text, seed=123456 + i)
 
-        # RunPod "runsync" expects images list with {name,image}
         payload = {
             "input": {
                 "return_type": "base64",
                 **wf,
                 "images": [
                     {"name": "art.png", "image": art_b64},
-                    {"name": "mask.png", "image": mask_b64},
-                ],
+                    {"name": "mask.png", "image": mask_b64}
+                ]
             }
         }
 
-        result = call_runsync(payload, timeout_sec=420)
+        result = call_runsync(payload, timeout_sec=480)
 
-        # log one raw sample for troubleshooting
         if i == 0:
             try:
                 print("RUNPOD_RAW_SAMPLE:", json.dumps(result)[:4000])
@@ -329,11 +397,10 @@ async def batch(template: str = Form(...), file: UploadFile = File(...)):
         outs = extract_images_from_output(result)
         images_all.append(outs[0] if outs else "MISSING")
 
-    return BatchResponse(template=template, prompt=prompt_text, images=images_all)
+    return BatchResponseModel(template=template, prompt=prompt_text, images=images_all)
 
 @app.post("/batch/html")
 async def batch_html(template: str = Form(...), file: UploadFile = File(...)):
-    """Quick visual check in the browser (POST with multipart form from Swagger)."""
     data = await batch(template, file)
     html = [f"<h2>{template}</h2><p>{TEMPLATES[template]['prompt']}</p>"]
     for idx, src in enumerate(data.images, 1):
