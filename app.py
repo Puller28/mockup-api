@@ -292,3 +292,28 @@ async def batch_html(template: str = Form(...), file: UploadFile = File(...)):
     resp = await batch(template, file)  # reuse core logic
     html_imgs = "".join(f'<div style="margin:8px 0"><img style="max-width:600px" src="{u}"><br><small>{u[:80]}...</small></div>' for u in resp.images)
     return f"<h3>{resp.template}</h3><p>{resp.prompt}</p>{html_imgs}"
+
+# add anywhere in app.py, e.g., below other routes
+from fastapi.responses import HTMLResponse
+
+@app.get("/try", response_class=HTMLResponse)
+def try_form():
+    return """
+    <h2>Mockup HTML Preview (POST to /batch/html)</h2>
+    <form action="/batch/html" method="post" enctype="multipart/form-data">
+      <label>Template:
+        <select name="template">
+          <option>bedroom</option>
+          <option>gallery_wall</option>
+          <option>modern_lounge</option>
+          <option>rustic_study</option>
+          <option>kitchen</option>
+        </select>
+      </label>
+      <br/><br/>
+      <input type="file" name="file" accept="image/*" required />
+      <br/><br/>
+      <button type="submit">Generate</button>
+    </form>
+    """
+
