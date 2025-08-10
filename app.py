@@ -100,16 +100,15 @@ def call_runsync(payload: dict, timeout_sec: int = 420) -> dict:
     except json.JSONDecodeError:
         raise HTTPException(status_code=502, detail={"runpod_runsync_error": "Invalid JSON from RunPod", "raw": r.text})
 
-def extract_images_from_output(status_payload: dict) -> List[str]:
+def extract_images_from_output(status_payload: dict) -> list[str]:
     """
-    Normalize a variety of RunPod/ComfyUI output shapes into a list of displayable image strings.
-    Preference order: URLs -> data URLs -> file paths (last resort).
+    Normalize RunPod/ComfyUI outputs into a list of displayable image strings.
+    Supports keys: url, base64, content, data, path, image_url, urls, base64[].
     """
     out = (status_payload or {}).get("output") or {}
+    results: list[str] = []
 
-    results: List[str] = []
-
-    # 1) {"output":{"images":[...]}}
+    # 1) Most common: {"output":{"images":[{...}, ...]}}
     imgs = out.get("images")
     if isinstance(imgs, list):
         for it in imgs:
@@ -118,10 +117,12 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
                     results.append(it["url"])
                 elif it.get("base64"):
                     results.append("data:image/png;base64," + it["base64"])
-                elif it.get("content"):  # some wrappers use 'content' for base64
+                elif it.get("content"):
                     results.append("data:image/png;base64," + it["content"])
+                elif it.get("data"):  # <-- your worker returns this
+                    results.append("data:image/png;base64," + it["data"])
                 elif it.get("path"):
-                    results.append(it["path"])
+                    results.append(it["path"])  # last resort
             elif isinstance(it, str):
                 if it.startswith("http"):
                     results.append(it)
@@ -144,7 +145,7 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
     if isinstance(b64s, list) and b64s:
         return ["data:image/png;base64," + b for b in b64s if isinstance(b, str) and b]
 
-    # 5) {"output":{"data":[{"images":[...]}, ...]}}
+    # 5) Some wrappers return {"output":{"data":[{"images":[...]}, ...]}}
     data_arr = out.get("data")
     if isinstance(data_arr, list):
         for item in data_arr:
@@ -157,6 +158,8 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
                             results.append("data:image/png;base64," + it["base64"])
                         elif it.get("content"):
                             results.append("data:image/png;base64," + it["content"])
+                        elif it.get("data"):
+                            results.append("data:image/png;base64," + it["data"])
                     elif isinstance(it, str):
                         if it.startswith("http"):
                             results.append(it)
@@ -165,11 +168,10 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
         if results:
             return results
 
-    # 6) {"output":{"image_path":"..."}}
+    # 6) Last-resort single path
     if isinstance(out.get("image_path"), str) and out["image_path"]:
         return [out["image_path"]]
 
-    # 7) Nothing recognized
     return []
 
 # ========= ComfyUI WORKFLOW =========
