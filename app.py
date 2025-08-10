@@ -1,3 +1,4 @@
+# app.py
 import os
 import io
 import json
@@ -15,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageDraw
 
 # ================== ENV ==================
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
@@ -49,7 +50,7 @@ app.add_middleware(
 class BatchResponse(BaseModel):
     template: str
     prompt: str
-    images: List[str]  # data-URLs (or http URLs if worker serves)
+    images: List[str]  # data-URLs or http URLs
 
 # ================== HTTP SESSION ==================
 def _build_session() -> requests.Session:
@@ -84,6 +85,10 @@ def to_data_url(b64_png_or_url: str) -> str:
     return "data:image/png;base64," + b64_png_or_url
 
 def extract_images_from_output(status_payload: dict) -> List[str]:
+    """
+    Normalize RunPod/ComfyUI outputs to a list of displayable strings.
+    Supports keys: url, base64, content, data, image, urls, image_url.
+    """
     out = (status_payload or {}).get("output") or {}
     results: List[str] = []
 
@@ -138,7 +143,7 @@ def extract_images_from_output(status_payload: dict) -> List[str]:
 
     return results
 
-def call_runsync(payload: dict, timeout_sec: int = 420) -> dict:
+def call_runsync(payload: dict, timeout_sec: int = 480) -> dict:
     url = f"{RUNPOD_ENDPOINT}/runsync"
     try:
         r = SESSION.post(url, json=payload, headers=_headers(), timeout=timeout_sec)
@@ -152,38 +157,33 @@ def call_runsync(payload: dict, timeout_sec: int = 420) -> dict:
         raise HTTPException(status_code=502, detail={"runpod_runsync_error": "Invalid JSON from RunPod", "raw": r.text})
 
 # ================== OUTPAINT PREP ==================
-CANVAS_SIZE = 1024           # final image 1024x1024
-ART_MAX_W, ART_MAX_H = 768, 896  # max art box (keep aspect), leaves margins for outpainting
-CANVAS_BG = (210, 210, 210)  # mid-light gray so the model has a neutral start
+CANVAS_SIZE = 1024                # final square image
+ART_MAX_W, ART_MAX_H = 768, 896   # art box (keep aspect), leaves margins for AI to paint
+CANVAS_BG = (210, 210, 210)       # neutral mid-light gray
 
 def make_canvas_and_mask(art_bytes: bytes) -> Dict[str, str]:
     """
-    Returns dict with base64 PNGs (without data: prefix):
-      - init.png: 1024x1024 canvas with your artwork centered (untouched)
-      - mask.png: white outside the art, black on the art (protect art)
-      - frame_box: (x, y, w, h) in pixels (for info/logs)
+    Build:
+      - init.png (1024x1024) with the artwork centered (untouched)
+      - mask.png (white outside art, black on art)
+    Return base64 PNGs (no data: prefix) + frame box info (for logging/debug).
     """
-    # Load & normalize
     art = Image.open(io.BytesIO(art_bytes)).convert("RGB")
-
-    # Compute fit box preserving aspect into ART_MAX_W x ART_MAX_H
     aw, ah = art.size
     scale = min(ART_MAX_W / aw, ART_MAX_H / ah, 1.0)
     tw, th = max(1, int(aw * scale)), max(1, int(ah * scale))
 
-    # Create canvas and paste centered
     canvas = Image.new("RGB", (CANVAS_SIZE, CANVAS_SIZE), CANVAS_BG)
     x = (CANVAS_SIZE - tw) // 2
     y = (CANVAS_SIZE - th) // 2
     art_resized = art.resize((tw, th), Image.LANCZOS)
     canvas.paste(art_resized, (x, y))
 
-    # Create mask: white outside art (to paint), black where art is (protect)
-    mask = Image.new("L", (CANVAS_SIZE, CANVAS_SIZE), 255)  # white = paint
+    # Mask: white (255)=paint here, black (0)=protect artwork
+    mask = Image.new("L", (CANVAS_SIZE, CANVAS_SIZE), 255)
     draw = ImageDraw.Draw(mask)
-    draw.rectangle([x, y, x + tw, y + th], fill=0)          # black = keep
+    draw.rectangle([x, y, x + tw, y + th], fill=0)
 
-    # Encode PNGs to base64 (no data: prefix)
     def to_b64(img: Image.Image) -> str:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -199,9 +199,12 @@ def make_canvas_and_mask(art_bytes: bytes) -> Dict[str, str]:
 def build_outpaint_workflow(prompt: str, neg: str, seed: int,
                             init_b64_png: str, mask_b64_png: str) -> dict:
     """
-    Uses VAEEncodeForInpaint so the model paints ONLY outside the protected art.
-    - Convert mask IMAGE -> MASK via ImageToMask
-    - Provide grow_mask_by as required by your worker
+    True outpainting:
+      - Load init canvas (art centered)
+      - Load mask image, convert IMAGE->MASK with channel="luminance"
+      - VAEEncodeForInpaint with grow_mask_by
+      - KSampler generates ONLY outside mask
+      - Decode + Save
     """
     workflow = {
         "100": {  # Model
@@ -213,26 +216,29 @@ def build_outpaint_workflow(prompt: str, neg: str, seed: int,
         "3": { "class_type": "CLIPTextEncode", "inputs": {"clip": ["100", 1], "text": prompt} },
         "4": { "class_type": "CLIPTextEncode", "inputs": {"clip": ["100", 1], "text": neg} },
 
-        # Init canvas (art centered) and mask
+        # Images
         "10": { "class_type": "LoadImage", "inputs": {"image": "init.png", "upload": True} },
         "11": { "class_type": "LoadImage", "inputs": {"image": "mask.png", "upload": True} },
-        "11m": {  # <-- convert IMAGE to MASK
+        "11m": {  # convert IMAGE -> MASK
             "class_type": "ImageToMask",
-            "inputs": { "image": ["11", 0] }
+            "inputs": {
+                "image": ["11", 0],
+                "channel": "luminance"   # REQUIRED by your worker
+            }
         },
 
-        # Encode for inpaint (MASK type + required grow_mask_by)
+        # Encode for inpaint (requires MASK + grow_mask_by)
         "12": {
             "class_type": "VAEEncodeForInpaint",
             "inputs": {
                 "pixels": ["10", 0],
-                "mask": ["11m", 0],      # MASK, not IMAGE
-                "grow_mask_by": 8,       # required by your worker; adjust 4–16 for stronger protection
+                "mask": ["11m", 0],
+                "grow_mask_by": 8,  # expand protection (tune 4–16)
                 "vae": ["100", 2]
             }
         },
 
-        # KSampler paints ONLY outside mask
+        # KSampler paints ONLY outside the mask
         "13": {
             "class_type": "KSampler",
             "inputs": {
@@ -249,7 +255,7 @@ def build_outpaint_workflow(prompt: str, neg: str, seed: int,
             }
         },
 
-        # Decode and save
+        # Decode & Save
         "18": { "class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["100", 2]} },
         "19": { "class_type": "SaveImage", "inputs": {"images": ["18", 0], "filename_prefix": "outpainted_mockup"} }
     }
@@ -261,7 +267,6 @@ def build_outpaint_workflow(prompt: str, neg: str, seed: int,
             {"name": "mask.png", "image": "data:image/png;base64," + mask_b64_png}
         ]
     }
-
 
 # ================== ROUTES ==================
 @app.get("/")
@@ -294,9 +299,8 @@ async def batch(template: str = Form(...), file: UploadFile = File(...)):
     if template not in TEMPLATES:
         raise HTTPException(status_code=400, detail=f"Invalid template. Available: {list(TEMPLATES.keys())}")
 
-    # Prepare outpainting canvas+mask
     art_bytes = await file.read()
-    prep = make_canvas_and_mask(art_bytes)  # returns base64 (no prefix)
+    prep = make_canvas_and_mask(art_bytes)
     init_b64 = prep["init_png_b64"]
     mask_b64 = prep["mask_png_b64"]
 
