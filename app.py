@@ -137,39 +137,56 @@ def call_mask_worker(img_b64: str, mode: str = "preview") -> str:
 # ---------- ComfyUI workflow ----------
 def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
     """
-    Includes a checkpoint loader and VAE decode:
+    Vanilla Comfy inpaint pipeline:
       - CheckpointLoaderSimple -> model/clip/vae
-      - LoadImage (base64) + LoadImageMask (alpha)
-      - ApplyMaskToLatent -> KSampler (seed)
+      - LoadImage + LoadImageMask
+      - VAEEncodeForInpaint(image, mask) -> latent + mask
+      - KSampler(model, pos/neg, latent, noise, mask)
       - VAEDecode -> SaveImage
     """
     return {
+        # 0) Model / CLIP / VAE
         "ckpt": {
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": COMFY_MODEL}
         },
+
+        # 1) Inputs
         "img":   {"class_type": "LoadImage",     "inputs": {"image": "__b64_img__"}},
         "mask":  {"class_type": "LoadImageMask", "inputs": {"image": "__b64_mask__", "channel": "alpha"}},
-        "pos":   {"class_type": "CLIPTextEncode","inputs": {"text": prompt, "clip": ["ckpt", 1]}},
-        "neg":   {"class_type": "CLIPTextEncode","inputs": {"text": "",      "clip": ["ckpt", 1]}},
-        "prep":  {"class_type": "ApplyMaskToLatent", "inputs": {"image": ["img", 0], "mask": ["mask", 0]}},
+
+        # 2) Text encodes (need CLIP from ckpt)
+        "pos":   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["ckpt", 1]}},
+        "neg":   {"class_type": "CLIPTextEncode", "inputs": {"text": "",      "clip": ["ckpt", 1]}},
+
+        # 3) Encode to latent and prepare a proper inpaint mask (vanilla node)
+        "enc": {
+            "class_type": "VAEEncodeForInpaint",
+            "inputs": {"pixels": ["img", 0], "mask": ["mask", 0], "vae": ["ckpt", 2]}
+        },
+
+        # 4) Noise + KSampler (mask-aware)
         "noise": {"class_type": "RandomNoise", "inputs": {"seed": seed}},
         "sampler": {
             "class_type": "KSampler",
             "inputs": {
-                "model": ["ckpt", 0],              # from checkpoint
+                "model": ["ckpt", 0],
                 "positive": ["pos", 0],
                 "negative": ["neg", 0],
-                "latent_image": ["prep", 0],
+                "latent_image": ["enc", 0],   # encoded latent
                 "noise": ["noise", 0],
+                "mask": ["enc", 1],           # inpaint mask from encoder
                 "steps": 22,
                 "cfg": 7.5,
                 "sampler_name": "euler"
             }
         },
+
+        # 5) Decode latent -> image and save
         "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
         "out":    {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
     }
+
 
 def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
     wf = json.loads(
