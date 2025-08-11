@@ -1,0 +1,14 @@
+# CPU image with ONNX Runtime + Serverless shim
+FROM runpod/serverless:py3.10-onnxruntime
+
+WORKDIR /workspace
+
+# Install deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Add handler
+COPY handler.py .
+
+# Start the serverless handler (handler.py already calls runpod.serverless.start)
+CMD ["python", "-u", "handler.py"]
