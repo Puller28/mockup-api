@@ -1,3 +1,5 @@
+# app.py — Mockup API (Preview + Finalise)
+
 import io
 import os
 import json
@@ -22,15 +24,15 @@ RUNPOD_ENDPOINT = os.getenv("RUNPOD_ENDPOINT", "")  # e.g. https://api.runpod.ai
 
 # Preview behaviour (low RAM)
 MAX_PREVIEW_SIDE = int(os.getenv("MAX_PREVIEW_SIDE", "1536"))  # long side clamp
-PREVIEW_MODEL = os.getenv("PREVIEW_MODEL", "isnet-general-lite")  # or "u2netp"
+PREVIEW_MODEL = os.getenv("PREVIEW_MODEL", "u2netp")  # smallest model available in rembg==2.0.67
 
-# Finalise behaviour (higher quality, a bit more RAM)
+# Finalise behaviour (higher quality)
 MAX_FINAL_SIDE = int(os.getenv("MAX_FINAL_SIDE", "2048"))
-FINALISE_MODEL = os.getenv("FINALISE_MODEL", "u2net")  # or "isnet-general"
+FINALISE_MODEL = os.getenv("FINALISE_MODEL", "u2net")  # higher quality
 
 # Upload limits
-MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8 MB default
-MAX_PIXELS = int(os.getenv("MAX_UPLOAD_PIXELS", str(12_000_000)))     # safety net
+MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))   # 8 MB
+MAX_PIXELS = int(os.getenv("MAX_UPLOAD_PIXELS", str(12_000_000)))      # safety net
 
 # Concurrency knobs for small instances
 os.environ.setdefault("WEB_CONCURRENCY", "1")
@@ -42,7 +44,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 # ----------------------------
 # App & CORS
 # ----------------------------
-app = FastAPI(title="Mockup API (Preview + Finalise)", version="1.2.0")
+app = FastAPI(title="Mockup API (Preview + Finalise)", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,10 +53,33 @@ app.add_middleware(
 )
 
 # ----------------------------
-# rembg sessions (load once)
+# rembg sessions (lazy init to avoid build failures)
 # ----------------------------
-PREVIEW_SESSION = new_session(PREVIEW_MODEL)
-FINALISE_SESSION = new_session(FINALISE_MODEL)
+_PREVIEW_SESSION = None
+_FINALISE_SESSION = None
+
+def get_preview_session():
+    global _PREVIEW_SESSION
+    if _PREVIEW_SESSION is None:
+        _PREVIEW_SESSION = _safe_new_session(PREVIEW_MODEL, ["u2netp", "u2net"])
+    return _PREVIEW_SESSION
+
+def get_finalise_session():
+    global _FINALISE_SESSION
+    if _FINALISE_SESSION is None:
+        _FINALISE_SESSION = _safe_new_session(FINALISE_MODEL, ["u2net", "u2netp"])
+    return _FINALISE_SESSION
+
+def _safe_new_session(name: str, fallbacks: list[str]):
+    try:
+        return new_session(name)
+    except Exception:
+        for fb in fallbacks:
+            try:
+                return new_session(fb)
+            except Exception:
+                continue
+        raise
 
 # ----------------------------
 # Utilities
@@ -88,10 +113,10 @@ def read_upload_image(file: UploadFile) -> Image.Image:
 def make_mask(img_rgba: Image.Image, *, mode: str) -> Image.Image:
     """
     mode = 'preview' or 'final'
-    - preview: low RAM, no alpha_matting
-    - final: higher quality, alpha_matting on
+    - preview: low RAM, alpha_matting=False using u2netp by default
+    - final: higher quality, alpha_matting=True using u2net
     """
-    session = PREVIEW_SESSION if mode == "preview" else FINALISE_SESSION
+    session = get_preview_session() if mode == "preview" else get_finalise_session()
     alpha_matting = False if mode == "preview" else True
 
     buf = io.BytesIO()
@@ -101,7 +126,7 @@ def make_mask(img_rgba: Image.Image, *, mode: str) -> Image.Image:
         buf.getvalue(),
         session=session,
         alpha_matting=alpha_matting,
-        post_process_mask=True,  # keeps edges clean without big RAM
+        post_process_mask=True,  # cleaner edges without high RAM cost
     )
     return Image.open(io.BytesIO(out_bytes)).convert("RGBA")
 
@@ -130,21 +155,17 @@ def build_workflow(seed: int, prompt: str) -> dict:
                 "sampler_name": "euler"
             }
         },
-        # In your Comfy graph, you may add a tiny feather and contact shadow here
+        # Optional: add tiny feather/contact shadow in your own graph here
         "out": {"class_type": "SaveImage", "inputs": {"images": ["sampler", 0]}}
     }
 
-def call_runpod(workflow: dict, img_b64: str, mask_b64: str, prompt: str, timeout: int = 120) -> List[str]:
+def call_runpod(workflow: dict, img_b64: str, mask_b64: str, timeout: int = 120) -> List[str]:
     ensure_env()
+    # substitute placeholders
     wf_json = json.dumps(workflow).replace("__b64_img__", img_b64).replace("__b64_mask__", mask_b64)
     workflow_payload = json.loads(wf_json)
 
-    payload = {
-        "input": {
-            "return_type": "base64",
-            "workflow": workflow_payload
-        }
-    }
+    payload = {"input": {"return_type": "base64", "workflow": workflow_payload}}
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
 
     try:
@@ -158,9 +179,7 @@ def call_runpod(workflow: dict, img_b64: str, mask_b64: str, prompt: str, timeou
     data = resp.json()
     images = data.get("output", {}).get("images", [])
     if not images:
-        # Some templates return {"output": ["<b64>", ...]}
-        images = [{"image": im} for im in data.get("output", [])]
-
+        images = [{"image": im} for im in data.get("output", [])]  # some templates return list[str]
     b64_list = [im.get("image") for im in images if isinstance(im, dict) and "image" in im]
     if not b64_list:
         raise HTTPException(status_code=502, detail="RunPod returned no images")
@@ -208,7 +227,7 @@ def index():
     <input type="text" name="prompt" placeholder="Describe the background…" required />
     <button type="submit">Generate 5 preview variations</button>
   </form>
-  <p style="color:#666">For programmatic use: POST /preview/json or /finalise/json</p>
+  <p style="color:#666">Programmatic: POST /preview/json or /finalise/json</p>
 </body>
 </html>
 """.strip()
@@ -223,19 +242,7 @@ def debug_deps():
         out = subprocess.check_output([sys.executable, "-m", "pip", "list"], text=True)
     except Exception as e:
         out = f"pip list failed: {e}"
-    return {
-        "python": sys.version,
-        "have_python_multipart": _have_multipart(),
-        "pip_list": out,
-    }
-
-def _have_multipart() -> bool:
-    try:
-        import importlib
-        importlib.import_module("multipart")
-        return True
-    except Exception:
-        return False
+    return {"python": sys.version, "pip_list": out}
 
 # ---------- PREVIEW (RAM-friendly) ----------
 
@@ -264,7 +271,7 @@ async def preview_json(
     results = []
     for seed in seeds:
         wf = build_workflow(seed=seed, prompt=prompt)
-        imgs = call_runpod(wf, img_b64=img_b64, mask_b64=mask_b64, prompt=prompt)
+        imgs = call_runpod(wf, img_b64=img_b64, mask_b64=mask_b64)
         results.append({"seed": seed, "image_b64": imgs[0]})
 
     return JSONResponse({"count": len(results), "results": results, "mode": "preview"})
@@ -289,7 +296,7 @@ async def finalise_json(
     target_side: Optional[int] = Form(None)  # override if you want e.g. 3000
 ):
     """
-    Re-runs one variation at higher quality.
+    Re-run one variation at higher quality.
     - Provide the same image and prompt as preview.
     - Optionally pass 'seed' from a preview result to reproduce composition.
     - Uses a stronger rembg session and alpha_matting=True.
@@ -312,7 +319,7 @@ async def finalise_json(
 
     chosen_seed = int(seed) if seed is not None else secrets.randbits(32)
     wf = build_workflow(seed=chosen_seed, prompt=prompt)
-    imgs = call_runpod(wf, img_b64=img_b64, mask_b64=mask_b64, prompt=prompt)
+    imgs = call_runpod(wf, img_b64=img_b64, mask_b64=mask_b64)
 
     return JSONResponse({
         "seed": chosen_seed,
