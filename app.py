@@ -14,7 +14,7 @@ from PIL import Image
 app = FastAPI(
     title="Mockup API",
     description="Upload an image and generate wall-art mockups via RunPod (mask worker + ComfyUI).",
-    version="2.1"
+    version="2.2"
 )
 
 # ---------------- Env ----------------
@@ -32,99 +32,101 @@ def _assert_env():
 
 # ------------- Presets ---------------
 STYLE_PRESETS: Dict[str, str] = {
-    "modern_living_room": "A realistic interior photo of a modern living room with a large framed art piece on a light grey wall above a mid-century style sofa. Soft natural daylight from the side, gentle shadows, harmonious neutral tones, subtle wall texture. The artwork is perfectly aligned, scale and perspective match the room with depth and realism.",
-    "minimal_gallery": "A bright minimalist gallery space with white walls and light oak flooring featuring a single large framed art piece as the focal point. Even diffused lighting clean shadows balanced perspective and soft depth in the background. Colours are harmonious giving the artwork a premium exhibition feel.",
-    "reading_nook": "A cosy reading nook with a framed art piece on the wall above a comfortable armchair soft ambient lighting from a nearby lamp and warm daylight from a window. Subtle depth realistic shadows and harmonious tones that make the artwork feel naturally part of the space.",
-    "scandi_bedroom": "A Scandinavian style bedroom with a framed art piece above the bed light pastel wall colours linen bedding and natural wood furniture. Bright diffused daylight from the window realistic soft shadows and perfect alignment of the art to match scale and perspective.",
-    "industrial_loft": "An industrial style loft with exposed brick walls metal window frames and a framed art piece mounted centrally. Natural daylight streaming through tall windows realistic depth shadows matching the light direction and warm yet balanced tones.",
-    "elegant_hallway": "A bright elegant hallway with a single framed art piece hanging on a cream coloured wall. Subtle depth with the hallway receding in the background soft natural light from side windows and balanced colours that highlight the artwork without overpowering it."
+    "modern_living_room": "modern Scandinavian living room interior, white wall with subtle texture, light oak floor, soft natural daylight from large windows, realistic photography, clean composition",
+    "minimal_gallery": "minimalist art gallery wall, white walls, professional gallery lighting, subtle wall texture, premium interior photography, neutral palette",
+    "reading_nook": "cozy reading nook, framed art above armchair, warm ambient lamp light plus soft daylight, realistic shadows, inviting neutral tones",
+    "scandi_bedroom": "Scandinavian bedroom, framed art above bed, pastel wall, linen bedding, bright diffused daylight, airy and realistic",
+    "industrial_loft": "industrial loft, exposed brick feature wall, concrete floor, tall metal windows with daylight, cinematic yet realistic shadows",
+    "elegant_hallway": "elegant hallway, cream wall with subtle texture, bright natural side light, professional interior photo, balanced tones"
 }
-def _resolve_prompt(style: str, prompt: str) -> str:
-    return STYLE_PRESETS.get(style) if style else (prompt or "A bright minimalist gallery space with soft daylight")
+DEFAULT_STYLE_KEY = "minimal_gallery"
+DEFAULT_PROMPT = STYLE_PRESETS[DEFAULT_STYLE_KEY]
+
+def build_prompt(style_value: str | None) -> str:
+    if not style_value:
+        return DEFAULT_PROMPT
+    s = style_value.strip()
+    return STYLE_PRESETS.get(s, s)  # preset key or free text
 
 # ------------- Helpers ---------------
-def pil_to_b64(img: Image.Image) -> str:
+def clamp_image(img: Image.Image, max_side=1280) -> Image.Image:
+    """Keep request small for serverless endpoints."""
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    s = max_side / float(m)
+    return img.resize((int(w * s), int(h * s)), Image.LANCZOS)
+
+def b64_png(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+def b64_jpeg(img: Image.Image, q=90) -> str:
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=q, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
 def _headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
 
 def _post_sync(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Use /runsync endpoints."""
     try:
-        r = requests.post(endpoint, headers=_headers(), json=payload, timeout=180)
+        r = requests.post(endpoint, headers=_headers(), json=payload, timeout=240)
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"RunPod request failed to {endpoint}: {e}")
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=f"RunPod error from {endpoint}: {r.text}")
     return r.json()
 
-def _post_async(endpoint_run: str, payload: Dict[str, Any], timeout_s: int = 180, poll_every: float = 1.5) -> Dict[str, Any]:
-    """
-    For /run endpoints. We:
-      - POST to /run -> { id: "jobId" }
-      - Poll /status/{id} until COMPLETED or FAILED or timeout
-    """
+def _post_async(endpoint_run: str, payload: Dict[str, Any], timeout_s: int = 240, poll_every: float = 1.5) -> Dict[str, Any]:
     # 1) submit job
     try:
-        r = requests.post(endpoint_run, headers=_headers(), json=payload, timeout=30)
+        r = requests.post(endpoint_run, headers=_headers(), json=payload, timeout=60)
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"RunPod request failed to {endpoint_run}: {e}")
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=f"RunPod error from {endpoint_run}: {r.text}")
-
     job = r.json()
     job_id = job.get("id") or job.get("output", {}).get("id")
     if not job_id:
-        # Some templates return { id: ... }, others { output: { id: ... } }
         raise HTTPException(status_code=502, detail=f"RunPod /run did not return a job id: {job}")
 
     # 2) poll status
-    # Convert .../run -> .../status/<id>
-    base = endpoint_run.rsplit("/", 1)[0]  # strip /run
+    base = endpoint_run.rsplit("/", 1)[0]
     status_url = f"{base}/status/{job_id}"
-
     started = time.time()
     while True:
         try:
-            s = requests.get(status_url, headers=_headers(), timeout=30)
+            s = requests.get(status_url, headers=_headers(), timeout=60)
         except requests.RequestException as e:
             raise HTTPException(status_code=502, detail=f"RunPod status failed {status_url}: {e}")
         if s.status_code != 200:
             raise HTTPException(status_code=s.status_code, detail=f"RunPod status error {status_url}: {s.text}")
-
         js = s.json()
-        status = (js.get("status") or "").upper()
-        if status in ("COMPLETED", "COMPLETEDWITHERROR"):  # some templates use this
+        st = (js.get("status") or "").upper()
+        if st in ("COMPLETED", "COMPLETEDWITHERROR"):  # some templates use this
             return js
-        if status in ("FAILED", "CANCELLED"):
+        if st in ("FAILED", "CANCELLED"):
             raise HTTPException(status_code=502, detail=f"RunPod job failed {job_id}: {js}")
         if time.time() - started > timeout_s:
             raise HTTPException(status_code=504, detail=f"RunPod job timed out {job_id}")
         time.sleep(poll_every)
 
 def call_runpod(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Smart caller that supports both /runsync and /run."""
     if endpoint.rstrip("/").endswith("/runsync"):
         return _post_sync(endpoint, payload)
     if endpoint.rstrip("/").endswith("/run"):
         return _post_async(endpoint, payload)
-    # fallback: try sync first
     return _post_sync(endpoint, payload)
 
 # ---------- Mask worker ----------
 def call_mask_worker(img_b64: str, mode: str = "preview") -> str:
     payload = {"input": {"image_b64": img_b64, "mode": mode}}
     data = call_runpod(MASK_ENDPOINT, payload)
-    # /runsync returns { output: { mask_b64 } }
-    # /run returns { status: COMPLETED, output: { mask_b64 } }
     out = data.get("output") or {}
-    mask_b64 = out.get("mask_b64")
-    if not mask_b64:
-        # defensive: some custom handlers may return { mask_b64: ... }
-        mask_b64 = data.get("mask_b64")
+    mask_b64 = out.get("mask_b64") or data.get("mask_b64")
     if not mask_b64:
         raise HTTPException(status_code=502, detail=f"Mask worker returned no mask: {data}")
     return mask_b64
@@ -154,16 +156,14 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
         "out": {"class_type": "SaveImage", "inputs": {"images": ["sampler", 0]}}
     }
 
-def call_comfy(img_b64: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
+def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
     wf = json.loads(
         json.dumps(comfy_workflow(seed, prompt))
-        .replace("__b64_img__", img_b64)
+        .replace("__b64_img__", img_b64_for_comfy)
         .replace("__b64_mask__", mask_b64)
     )
     payload = {"input": {"return_type": "base64", "workflow": wf}}
     data = call_runpod(COMFY_ENDPOINT, payload)
-    # /runsync → { output: { images: [{image: "..."}] } }
-    # /run     → { status: COMPLETED, output: { images: [...] } }
     out = data.get("output") or {}
     images = out.get("images", [])
     if not images and isinstance(out, list):
@@ -185,48 +185,71 @@ def debug_env():
 async def mask_test(file: UploadFile = File(...), mode: str = Form("preview")):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
-    img_b64 = pil_to_b64(img)
-    mask_b64 = call_mask_worker(img_b64, mode=mode)
+    # the mask worker prefers PNG (alpha preserved)
+    mask_b64 = call_mask_worker(b64_png(img), mode=mode)
     return {"mode": mode, "mask_b64": mask_b64}
 
-@app.post("/preview/json", summary="Preview mockups (JSON, 5 variations)")
+@app.post(
+    "/preview/json",
+    summary="Preview mockups (JSON, 5 variations) — only set 'style' and 'mode'"
+)
 async def preview_json(
     file: UploadFile = File(...),
-    style: str = Form(""),
-    prompt: str = Form(""),
-    mode: str = Form("preview")
+    style: str = Form(DEFAULT_STYLE_KEY, description="Preset key (e.g. 'minimal_gallery') or free-text style"),
+    mode: str = Form("preview", description="'preview' (fast) or 'final' (crisper mask)")
 ):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
-    img_b64 = pil_to_b64(img)
-    use_prompt = _resolve_prompt(style, prompt)
-    mask_b64 = call_mask_worker(img_b64, mode=mode)
+
+    # 1) Build prompt from style
+    prompt = build_prompt(style)
+
+    # 2) Mask uses PNG of the ORIGINAL (best edges)
+    mask_b64 = call_mask_worker(b64_png(img), mode=mode)
+
+    # 3) Comfy uses a compact JPEG of a CLAMPED image (prevents 502s)
+    img_small = clamp_image(img, max_side=1280)
+    img_b64_for_comfy = b64_jpeg(img_small, q=90)
 
     seeds = [secrets.randbits(32) for _ in range(5)]
     results = []
     for s in seeds:
-        imgs = call_comfy(img_b64, mask_b64, use_prompt, seed=s)
-        results.append({"seed": s, "image_b64": imgs[0]})
-    return {"mode": mode, "style": style or "custom", "prompt": use_prompt, "count": len(results), "results": results}
+        imgs = call_comfy(img_b64_for_comfy, mask_b64, prompt, seed=s)
+        if imgs:
+            results.append({"seed": s, "image_b64": imgs[0]})
 
-@app.post("/preview/html", summary="Preview mockups (HTML gallery, 5 variations)", response_class=HTMLResponse)
+    return {
+        "mode": mode,
+        "style": style,
+        "prompt_used": prompt,
+        "count": len(results),
+        "results": results
+    }
+
+@app.post(
+    "/preview/html",
+    summary="Preview mockups (HTML gallery, 5 variations) — only set 'style' and 'mode'",
+    response_class=HTMLResponse
+)
 async def preview_html(
     file: UploadFile = File(...),
-    style: str = Form(""),
-    prompt: str = Form(""),
-    mode: str = Form("preview")
+    style: str = Form(DEFAULT_STYLE_KEY, description="Preset key (e.g. 'minimal_gallery') or free-text style"),
+    mode: str = Form("preview", description="'preview' (fast) or 'final' (crisper mask)")
 ):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
-    img_b64 = pil_to_b64(img)
-    use_prompt = _resolve_prompt(style, prompt)
-    mask_b64 = call_mask_worker(img_b64, mode=mode)
+    prompt = build_prompt(style)
+
+    mask_b64 = call_mask_worker(b64_png(img), mode=mode)
+    img_small = clamp_image(img, max_side=1280)
+    img_b64_for_comfy = b64_jpeg(img_small, q=90)
 
     seeds = [secrets.randbits(32) for _ in range(5)]
     imgs64: List[str] = []
     for s in seeds:
-        out = call_comfy(img_b64, mask_b64, use_prompt, seed=s)
-        imgs64.append(out[0])
+        out = call_comfy(img_b64_for_comfy, mask_b64, prompt, seed=s)
+        if out:
+            imgs64.append(out[0])
 
     html = "<h1>Generated Mockups</h1><div style='display:flex;flex-wrap:wrap'>"
     for img64 in imgs64:
