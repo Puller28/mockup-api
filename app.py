@@ -1,3 +1,4 @@
+# app.py
 import io
 import os
 import json
@@ -14,33 +15,34 @@ from PIL import Image
 app = FastAPI(
     title="Mockup API",
     description="Upload an image and generate wall-art mockups via RunPod (mask worker + ComfyUI).",
-    version="2.2"
+    version="2.3"
 )
 
 # ---------------- Env ----------------
-RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
-MASK_ENDPOINT = os.getenv("RUNPOD_MASK_ENDPOINT")          # .../<MASK_ID>/runsync
-COMFY_ENDPOINT = os.getenv("RUNPOD_COMFY_ENDPOINT")        # .../<COMFY_ID>/run  or  .../runsync
+RUNPOD_API_KEY   = os.getenv("RUNPOD_API_KEY")
+MASK_ENDPOINT    = os.getenv("RUNPOD_MASK_ENDPOINT")      # .../<MASK_ID>/runsync
+COMFY_ENDPOINT   = os.getenv("RUNPOD_COMFY_ENDPOINT")     # .../<COMFY_EXEC_ID>/run  (async)
+COMFY_MODEL      = os.getenv("RUNPOD_COMFY_MODEL", "v1-5-pruned-emaonly.safetensors")
 
 def _assert_env():
     missing = []
     if not RUNPOD_API_KEY: missing.append("RUNPOD_API_KEY")
-    if not MASK_ENDPOINT: missing.append("RUNPOD_MASK_ENDPOINT")
+    if not MASK_ENDPOINT:  missing.append("RUNPOD_MASK_ENDPOINT")
     if not COMFY_ENDPOINT: missing.append("RUNPOD_COMFY_ENDPOINT")
     if missing:
         raise HTTPException(status_code=500, detail=f"Missing env: {', '.join(missing)}")
 
-# ------------- Presets ---------------
+# ------------- Style presets ---------------
 STYLE_PRESETS: Dict[str, str] = {
-    "modern_living_room": "modern Scandinavian living room interior, white wall with subtle texture, light oak floor, soft natural daylight from large windows, realistic photography, clean composition",
-    "minimal_gallery": "minimalist art gallery wall, white walls, professional gallery lighting, subtle wall texture, premium interior photography, neutral palette",
-    "reading_nook": "cozy reading nook, framed art above armchair, warm ambient lamp light plus soft daylight, realistic shadows, inviting neutral tones",
-    "scandi_bedroom": "Scandinavian bedroom, framed art above bed, pastel wall, linen bedding, bright diffused daylight, airy and realistic",
-    "industrial_loft": "industrial loft, exposed brick feature wall, concrete floor, tall metal windows with daylight, cinematic yet realistic shadows",
-    "elegant_hallway": "elegant hallway, cream wall with subtle texture, bright natural side light, professional interior photo, balanced tones"
+    "minimal_gallery":    "minimalist art gallery wall, white walls, professional gallery lighting, subtle wall texture, premium interior photography, neutral palette",
+    "modern_living_room": "modern Scandinavian living room, white wall with subtle texture, light oak floor, soft natural daylight from large windows, realistic photography, clean composition",
+    "reading_nook":       "cozy reading nook, framed art above armchair, warm ambient lamp light plus soft daylight, realistic shadows, inviting neutral tones",
+    "industrial_loft":    "industrial loft, exposed brick feature wall, concrete floor, tall metal windows with daylight, cinematic yet realistic shadows",
+    "scandi_bedroom":     "Scandinavian bedroom, framed art above bed, pastel wall, linen bedding, bright diffused daylight, airy and realistic",
+    "elegant_hallway":    "elegant hallway, cream wall with subtle texture, bright natural side light, professional interior photo, balanced tones"
 }
 DEFAULT_STYLE_KEY = "minimal_gallery"
-DEFAULT_PROMPT = STYLE_PRESETS[DEFAULT_STYLE_KEY]
+DEFAULT_PROMPT    = STYLE_PRESETS[DEFAULT_STYLE_KEY]
 
 def build_prompt(style_value: str | None) -> str:
     if not style_value:
@@ -48,7 +50,7 @@ def build_prompt(style_value: str | None) -> str:
     s = style_value.strip()
     return STYLE_PRESETS.get(s, s)  # preset key or free text
 
-# ------------- Helpers ---------------
+# ------------- Image helpers ---------------
 def clamp_image(img: Image.Image, max_side=1280) -> Image.Image:
     """Keep request small for serverless endpoints."""
     w, h = img.size
@@ -68,6 +70,7 @@ def b64_jpeg(img: Image.Image, q=90) -> str:
     img.convert("RGB").save(buf, format="JPEG", quality=q, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
+# ------------- HTTP helpers ---------------
 def _headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
 
@@ -106,7 +109,7 @@ def _post_async(endpoint_run: str, payload: Dict[str, Any], timeout_s: int = 240
             raise HTTPException(status_code=s.status_code, detail=f"RunPod status error {status_url}: {s.text}")
         js = s.json()
         st = (js.get("status") or "").upper()
-        if st in ("COMPLETED", "COMPLETEDWITHERROR"):  # some templates use this
+        if st in ("COMPLETED", "COMPLETEDWITHERROR"):
             return js
         if st in ("FAILED", "CANCELLED"):
             raise HTTPException(status_code=502, detail=f"RunPod job failed {job_id}: {js}")
@@ -131,19 +134,30 @@ def call_mask_worker(img_b64: str, mode: str = "preview") -> str:
         raise HTTPException(status_code=502, detail=f"Mask worker returned no mask: {data}")
     return mask_b64
 
-# ---------- ComfyUI ----------
+# ---------- ComfyUI workflow ----------
 def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
+    """
+    Includes a checkpoint loader and VAE decode:
+      - CheckpointLoaderSimple -> model/clip/vae
+      - LoadImage (base64) + LoadImageMask (alpha)
+      - ApplyMaskToLatent -> KSampler (seed)
+      - VAEDecode -> SaveImage
+    """
     return {
-        "img":   {"class_type": "LoadImage",      "inputs": {"image": "__b64_img__"}},
-        "mask":  {"class_type": "LoadImageMask",  "inputs": {"image": "__b64_mask__", "channel": "alpha"}},
-        "pos":   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt}},
-        "neg":   {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+        "ckpt": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": COMFY_MODEL}
+        },
+        "img":   {"class_type": "LoadImage",     "inputs": {"image": "__b64_img__"}},
+        "mask":  {"class_type": "LoadImageMask", "inputs": {"image": "__b64_mask__", "channel": "alpha"}},
+        "pos":   {"class_type": "CLIPTextEncode","inputs": {"text": prompt, "clip": ["ckpt", 1]}},
+        "neg":   {"class_type": "CLIPTextEncode","inputs": {"text": "",      "clip": ["ckpt", 1]}},
         "prep":  {"class_type": "ApplyMaskToLatent", "inputs": {"image": ["img", 0], "mask": ["mask", 0]}},
-        "noise": {"class_type": "RandomNoise",    "inputs": {"seed": seed}},
+        "noise": {"class_type": "RandomNoise", "inputs": {"seed": seed}},
         "sampler": {
             "class_type": "KSampler",
             "inputs": {
-                "model": ["checkpoint", 0],
+                "model": ["ckpt", 0],              # from checkpoint
                 "positive": ["pos", 0],
                 "negative": ["neg", 0],
                 "latent_image": ["prep", 0],
@@ -153,7 +167,8 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
                 "sampler_name": "euler"
             }
         },
-        "out": {"class_type": "SaveImage", "inputs": {"images": ["sampler", 0]}}
+        "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
+        "out":    {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
     }
 
 def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
@@ -178,14 +193,19 @@ def debug_env():
     return {
         "has_api_key": bool(RUNPOD_API_KEY),
         "mask_endpoint": MASK_ENDPOINT,
-        "comfy_endpoint": COMFY_ENDPOINT
+        "comfy_endpoint": COMFY_ENDPOINT,
+        "comfy_model": COMFY_MODEL
     }
+
+@app.get("/styles", summary="List preset style keys")
+def styles():
+    return {"default": DEFAULT_STYLE_KEY, "presets": STYLE_PRESETS}
 
 @app.post("/mask/test", summary="Test mask worker (returns mask only)")
 async def mask_test(file: UploadFile = File(...), mode: str = Form("preview")):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
-    # the mask worker prefers PNG (alpha preserved)
+    # best for edges: mask worker gets PNG of original
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
     return {"mode": mode, "mask_b64": mask_b64}
 
@@ -200,14 +220,10 @@ async def preview_json(
 ):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
-
-    # 1) Build prompt from style
     prompt = build_prompt(style)
 
-    # 2) Mask uses PNG of the ORIGINAL (best edges)
+    # Mask: PNG of original; Comfy: JPEG of clamped image
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
-
-    # 3) Comfy uses a compact JPEG of a CLAMPED image (prevents 502s)
     img_small = clamp_image(img, max_side=1280)
     img_b64_for_comfy = b64_jpeg(img_small, q=90)
 
@@ -218,13 +234,7 @@ async def preview_json(
         if imgs:
             results.append({"seed": s, "image_b64": imgs[0]})
 
-    return {
-        "mode": mode,
-        "style": style,
-        "prompt_used": prompt,
-        "count": len(results),
-        "results": results
-    }
+    return {"mode": mode, "style": style, "prompt_used": prompt, "count": len(results), "results": results}
 
 @app.post(
     "/preview/html",
