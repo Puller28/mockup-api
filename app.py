@@ -152,6 +152,7 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
         "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
         "out":    {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
     }
+
 def runpod_run_and_wait(endpoint_run: str, payload: dict, timeout_s: int = 240, poll_every: float = 1.5) -> dict:
     """POST to /run, then poll /status/{id} until COMPLETED/FAILED."""
     # submit
@@ -192,6 +193,7 @@ def runpod_run_and_wait(endpoint_run: str, payload: dict, timeout_s: int = 240, 
 
 
 def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
+    # img_b64_for_comfy and mask_b64 are expected to be **data URLs**
     wf = json.loads(
         json.dumps(comfy_workflow(seed, prompt))
         .replace("__b64_img__", img_b64_for_comfy)
@@ -234,14 +236,19 @@ async def mask_test(file: UploadFile = File(...), mode: str = Form("preview")):
 
 def _generate_variations(img: Image.Image, style: str, mode: str, n: int = 5) -> List[Dict[str, Any]]:
     prompt = build_prompt(style)
+
+    # 1) Get mask (raw base64 PNG)
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
+    # 2) Prepare PNG for Comfy and prefix as data URL (IMPORTANT)
     img_small = clamp_image(img, max_side=1280)
-    img_b64_for_comfy = b64_jpeg(img_small, q=90)
+    img_png_b64 = b64_png(img_small)
+    img_data_url  = f"data:image/png;base64,{img_png_b64}"
+    mask_data_url = f"data:image/png;base64,{mask_b64}"
 
     seeds = [secrets.randbits(32) for _ in range(n)]
     results: List[Dict[str, Any]] = []
     for s in seeds:
-        imgs = call_comfy(img_b64_for_comfy, mask_b64, prompt, seed=s)
+        imgs = call_comfy(img_data_url, mask_data_url, prompt, seed=s)
         if imgs:
             results.append({"seed": s, "image_b64": imgs[0]})
     return results
