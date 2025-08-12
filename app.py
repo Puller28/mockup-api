@@ -85,7 +85,7 @@ def normalize_mask_b64(mask_b64: str) -> str:
     except Exception:
         return mask_b64
     
-    def _strip_data_url(b64_or_data_url: str) -> str:
+def _strip_data_url(b64_or_data_url: str) -> str:
     """If a 'data:image/...;base64,xxxx' string slips in, strip the header."""
     if isinstance(b64_or_data_url, str) and b64_or_data_url.startswith("data:"):
         try:
@@ -93,6 +93,7 @@ def normalize_mask_b64(mask_b64: str) -> str:
         except Exception:
             return b64_or_data_url
     return b64_or_data_url
+
 
 
 # ------------- HTTP helpers ---------------
