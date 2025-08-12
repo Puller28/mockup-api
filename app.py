@@ -15,7 +15,7 @@ from PIL import Image
 app = FastAPI(
     title="Mockup API",
     description="Upload an image and generate wall-art mockups via RunPod (mask worker + ComfyUI).",
-    version="2.3"
+    version="2.4"
 )
 
 # ---------------- Env ----------------
@@ -52,7 +52,6 @@ def build_prompt(style_value: str | None) -> str:
 
 # ------------- Image helpers ---------------
 def clamp_image(img: Image.Image, max_side=1280) -> Image.Image:
-    """Keep request small for serverless endpoints."""
     w, h = img.size
     m = max(w, h)
     if m <= max_side:
@@ -70,41 +69,46 @@ def b64_jpeg(img: Image.Image, q=90) -> str:
     img.convert("RGB").save(buf, format="JPEG", quality=q, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
+def normalize_mask_b64(mask_b64: str) -> str:
+    """Decode -> sanitize -> re-encode mask as a clean RGBA PNG with alpha channel."""
+    try:
+        raw = base64.b64decode(mask_b64)
+        im = Image.open(io.BytesIO(raw)).convert("RGBA")
+        if "A" in im.getbands():
+            alpha = im.getchannel("A")
+        else:
+            alpha = im.convert("L")
+        clean = Image.new("RGBA", im.size, (255, 255, 255, 0))
+        clean.putalpha(alpha)
+        buf = io.BytesIO()
+        clean.save(buf, format="PNG", optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return mask_b64
+
 # ------------- HTTP helpers ---------------
 def _headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
 
 def _post_sync(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        r = requests.post(endpoint, headers=_headers(), json=payload, timeout=240)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"RunPod request failed to {endpoint}: {e}")
+    r = requests.post(endpoint, headers=_headers(), json=payload, timeout=240)
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=f"RunPod error from {endpoint}: {r.text}")
     return r.json()
 
 def _post_async(endpoint_run: str, payload: Dict[str, Any], timeout_s: int = 240, poll_every: float = 1.5) -> Dict[str, Any]:
-    # 1) submit job
-    try:
-        r = requests.post(endpoint_run, headers=_headers(), json=payload, timeout=60)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"RunPod request failed to {endpoint_run}: {e}")
+    r = requests.post(endpoint_run, headers=_headers(), json=payload, timeout=60)
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=f"RunPod error from {endpoint_run}: {r.text}")
     job = r.json()
     job_id = job.get("id") or job.get("output", {}).get("id")
     if not job_id:
         raise HTTPException(status_code=502, detail=f"RunPod /run did not return a job id: {job}")
-
-    # 2) poll status
     base = endpoint_run.rsplit("/", 1)[0]
     status_url = f"{base}/status/{job_id}"
     started = time.time()
     while True:
-        try:
-            s = requests.get(status_url, headers=_headers(), timeout=60)
-        except requests.RequestException as e:
-            raise HTTPException(status_code=502, detail=f"RunPod status failed {status_url}: {e}")
+        s = requests.get(status_url, headers=_headers(), timeout=60)
         if s.status_code != 200:
             raise HTTPException(status_code=s.status_code, detail=f"RunPod status error {status_url}: {s.text}")
         js = s.json()
@@ -136,36 +140,19 @@ def call_mask_worker(img_b64: str, mode: str = "preview") -> str:
 
 # ---------- ComfyUI workflow ----------
 def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
-    """
-    Vanilla Comfy inpaint pipeline:
-      - CheckpointLoaderSimple -> model/clip/vae
-      - LoadImage + LoadImageMask
-      - VAEEncodeForInpaint(image, mask) -> latent + mask
-      - KSampler(model, pos/neg, latent, noise, mask)
-      - VAEDecode -> SaveImage
-    """
     return {
-        # 0) Model / CLIP / VAE
         "ckpt": {
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": COMFY_MODEL}
         },
-
-        # 1) Inputs
         "img":   {"class_type": "LoadImage",     "inputs": {"image": "__b64_img__"}},
         "mask":  {"class_type": "LoadImageMask", "inputs": {"image": "__b64_mask__", "channel": "alpha"}},
-
-        # 2) Text encodes (need CLIP from ckpt)
         "pos":   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["ckpt", 1]}},
         "neg":   {"class_type": "CLIPTextEncode", "inputs": {"text": "",      "clip": ["ckpt", 1]}},
-
-        # 3) Encode to latent and prepare a proper inpaint mask (vanilla node)
         "enc": {
             "class_type": "VAEEncodeForInpaint",
             "inputs": {"pixels": ["img", 0], "mask": ["mask", 0], "vae": ["ckpt", 2]}
         },
-
-        # 4) Noise + KSampler (mask-aware)
         "noise": {"class_type": "RandomNoise", "inputs": {"seed": seed}},
         "sampler": {
             "class_type": "KSampler",
@@ -173,20 +160,17 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
                 "model": ["ckpt", 0],
                 "positive": ["pos", 0],
                 "negative": ["neg", 0],
-                "latent_image": ["enc", 0],   # encoded latent
+                "latent_image": ["enc", 0],
                 "noise": ["noise", 0],
-                "mask": ["enc", 1],           # inpaint mask from encoder
+                "mask": ["enc", 1],
                 "steps": 22,
                 "cfg": 7.5,
                 "sampler_name": "euler"
             }
         },
-
-        # 5) Decode latent -> image and save
         "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
         "out":    {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
     }
-
 
 def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
     wf = json.loads(
@@ -214,33 +198,31 @@ def debug_env():
         "comfy_model": COMFY_MODEL
     }
 
-@app.get("/styles", summary="List preset style keys")
+@app.get("/styles")
 def styles():
     return {"default": DEFAULT_STYLE_KEY, "presets": STYLE_PRESETS}
 
-@app.post("/mask/test", summary="Test mask worker (returns mask only)")
+@app.post("/mask/test")
 async def mask_test(file: UploadFile = File(...), mode: str = Form("preview")):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
-    # best for edges: mask worker gets PNG of original
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
+    mask_b64 = normalize_mask_b64(mask_b64)
     return {"mode": mode, "mask_b64": mask_b64}
 
-@app.post(
-    "/preview/json",
-    summary="Preview mockups (JSON, 5 variations) — only set 'style' and 'mode'"
-)
+@app.post("/preview/json")
 async def preview_json(
     file: UploadFile = File(...),
-    style: str = Form(DEFAULT_STYLE_KEY, description="Preset key (e.g. 'minimal_gallery') or free-text style"),
-    mode: str = Form("preview", description="'preview' (fast) or 'final' (crisper mask)")
+    style: str = Form(DEFAULT_STYLE_KEY),
+    mode: str = Form("preview")
 ):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
     prompt = build_prompt(style)
 
-    # Mask: PNG of original; Comfy: JPEG of clamped image
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
+    mask_b64 = normalize_mask_b64(mask_b64)
+
     img_small = clamp_image(img, max_side=1280)
     img_b64_for_comfy = b64_jpeg(img_small, q=90)
 
@@ -253,21 +235,19 @@ async def preview_json(
 
     return {"mode": mode, "style": style, "prompt_used": prompt, "count": len(results), "results": results}
 
-@app.post(
-    "/preview/html",
-    summary="Preview mockups (HTML gallery, 5 variations) — only set 'style' and 'mode'",
-    response_class=HTMLResponse
-)
+@app.post("/preview/html", response_class=HTMLResponse)
 async def preview_html(
     file: UploadFile = File(...),
-    style: str = Form(DEFAULT_STYLE_KEY, description="Preset key (e.g. 'minimal_gallery') or free-text style"),
-    mode: str = Form("preview", description="'preview' (fast) or 'final' (crisper mask)")
+    style: str = Form(DEFAULT_STYLE_KEY),
+    mode: str = Form("preview")
 ):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
     prompt = build_prompt(style)
 
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
+    mask_b64 = normalize_mask_b64(mask_b64)
+
     img_small = clamp_image(img, max_side=1280)
     img_b64_for_comfy = b64_jpeg(img_small, q=90)
 
