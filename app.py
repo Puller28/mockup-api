@@ -5,7 +5,7 @@ import json
 import time
 import base64
 import secrets
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import requests
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
@@ -15,14 +15,15 @@ from PIL import Image
 app = FastAPI(
     title="Mockup API",
     description="Upload an image and generate wall-art mockups via RunPod (mask worker + ComfyUI).",
-    version="2.4"
+    version="2.5"
 )
 
 # ---------------- Env ----------------
 RUNPOD_API_KEY   = os.getenv("RUNPOD_API_KEY")
 MASK_ENDPOINT    = os.getenv("RUNPOD_MASK_ENDPOINT")      # .../<MASK_ID>/runsync
-COMFY_ENDPOINT   = os.getenv("RUNPOD_COMFY_ENDPOINT")     # .../<COMFY_EXEC_ID>/run  (async)
-COMFY_MODEL      = os.getenv("RUNPOD_COMFY_MODEL", "v1-5-pruned-emaonly.safetensors")
+COMFY_ENDPOINT   = os.getenv("RUNPOD_COMFY_ENDPOINT")     # .../<COMFY_ID>/run  (async) or .../runsync
+# Default to Flux checkpoint because that’s what your endpoint showed; change if needed.
+COMFY_MODEL      = os.getenv("RUNPOD_COMFY_MODEL", "flux1-dev-fp8.safetensors")
 
 def _assert_env():
     missing = []
@@ -52,6 +53,7 @@ def build_prompt(style_value: str | None) -> str:
 
 # ------------- Image helpers ---------------
 def clamp_image(img: Image.Image, max_side=1280) -> Image.Image:
+    """Downscale longest side to max_side while keeping aspect ratio."""
     w, h = img.size
     m = max(w, h)
     if m <= max_side:
@@ -69,21 +71,27 @@ def b64_jpeg(img: Image.Image, q=90) -> str:
     img.convert("RGB").save(buf, format="JPEG", quality=q, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
-def normalize_mask_b64(mask_b64: str) -> str:
-    """Decode -> sanitize -> re-encode mask as a clean RGBA PNG with alpha channel."""
+def resize_mask_b64(mask_b64: str, target_size: Tuple[int, int]) -> str:
+    """
+    Decode mask -> convert to RGBA -> resize to target_size with NEAREST
+    (keeps crisp edges) -> re-encode as clean PNG base64.
+    """
     try:
         raw = base64.b64decode(mask_b64)
         im = Image.open(io.BytesIO(raw)).convert("RGBA")
-        if "A" in im.getbands():
-            alpha = im.getchannel("A")
-        else:
-            alpha = im.convert("L")
-        clean = Image.new("RGBA", im.size, (255, 255, 255, 0))
-        clean.putalpha(alpha)
+
+        # Build alpha channel
+        alpha = im.getchannel("A") if "A" in im.getbands() else im.convert("L")
+        alpha_resized = alpha.resize(target_size, Image.NEAREST)
+
+        clean = Image.new("RGBA", target_size, (255, 255, 255, 0))
+        clean.putalpha(alpha_resized)
+
         buf = io.BytesIO()
         clean.save(buf, format="PNG", optimize=True)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception:
+        # Fall back to original if anything odd happens
         return mask_b64
 
 # ------------- HTTP helpers ---------------
@@ -91,26 +99,38 @@ def _headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
 
 def _post_sync(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.post(endpoint, headers=_headers(), json=payload, timeout=240)
+    try:
+        r = requests.post(endpoint, headers=_headers(), json=payload, timeout=240)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"RunPod request failed to {endpoint}: {e}")
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=f"RunPod error from {endpoint}: {r.text}")
     return r.json()
 
 def _post_async(endpoint_run: str, payload: Dict[str, Any], timeout_s: int = 240, poll_every: float = 1.5) -> Dict[str, Any]:
-    r = requests.post(endpoint_run, headers=_headers(), json=payload, timeout=60)
+    try:
+        r = requests.post(endpoint_run, headers=_headers(), json=payload, timeout=60)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"RunPod request failed to {endpoint_run}: {e}")
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=f"RunPod error from {endpoint_run}: {r.text}")
     job = r.json()
     job_id = job.get("id") or job.get("output", {}).get("id")
     if not job_id:
         raise HTTPException(status_code=502, detail=f"RunPod /run did not return a job id: {job}")
+
     base = endpoint_run.rsplit("/", 1)[0]
     status_url = f"{base}/status/{job_id}"
+
     started = time.time()
     while True:
-        s = requests.get(status_url, headers=_headers(), timeout=60)
+        try:
+            s = requests.get(status_url, headers=_headers(), timeout=60)
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"RunPod status failed {status_url}: {e}")
         if s.status_code != 200:
             raise HTTPException(status_code=s.status_code, detail=f"RunPod status error {status_url}: {s.text}")
+
         js = s.json()
         st = (js.get("status") or "").upper()
         if st in ("COMPLETED", "COMPLETEDWITHERROR"):
@@ -141,7 +161,7 @@ def call_mask_worker(img_b64: str, mode: str = "preview") -> str:
 # ---------- ComfyUI workflow ----------
 def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
     """
-    Vanilla Comfy inpaint pipeline:
+    Robust inpaint graph (vanilla-safe):
       - CheckpointLoaderSimple -> model/clip/vae
       - LoadImage (subject) + LoadImage (mask) -> ImageToMask
       - VAEEncodeForInpaint(pixels, mask)
@@ -149,52 +169,41 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
       - VAEDecode -> SaveImage
     """
     return {
-        # 0) Model / CLIP / VAE
-        "ckpt": {
-            "class_type": "CheckpointLoaderSimple",
-            "inputs": {"ckpt_name": COMFY_MODEL}
-        },
+        "ckpt": {"class_type": "CheckpointLoaderSimple",
+                 "inputs": {"ckpt_name": COMFY_MODEL}},
 
-        # 1) Inputs
+        # Inputs
         "img":      {"class_type": "LoadImage", "inputs": {"image": "__b64_img__"}},
-        # Load mask as a regular image (more tolerant than LoadImageMask)
         "mask_img": {"class_type": "LoadImage", "inputs": {"image": "__b64_mask__"}},
 
-        # Convert mask image -> mask tensor inside Comfy (robust)
+        # Convert image -> mask tensor (most tolerant)
         "to_mask":  {"class_type": "ImageToMask", "inputs": {"image": ["mask_img", 0]}},
 
-        # 2) Text encodes
+        # Text encodes
         "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["ckpt", 1]}},
         "neg": {"class_type": "CLIPTextEncode", "inputs": {"text": "",      "clip": ["ckpt", 1]}},
 
-        # 3) Encode to latent with inpaint mask
-        "enc": {
-            "class_type": "VAEEncodeForInpaint",
-            "inputs": {"pixels": ["img", 0], "mask": ["to_mask", 0], "vae": ["ckpt", 2]}
-        },
+        # Latent encode for inpaint
+        "enc": {"class_type": "VAEEncodeForInpaint",
+                "inputs": {"pixels": ["img", 0], "mask": ["to_mask", 0], "vae": ["ckpt", 2]}},
 
-        # 4) Sample
+        # Sample
         "noise": {"class_type": "RandomNoise", "inputs": {"seed": seed}},
-        "sampler": {
-            "class_type": "KSampler",
-            "inputs": {
-                "model": ["ckpt", 0],
-                "positive": ["pos", 0],
-                "negative": ["neg", 0],
-                "latent_image": ["enc", 0],
-                "noise": ["noise", 0],
-                "mask": ["enc", 1],
-                "steps": 22,
-                "cfg": 7.5,
-                "sampler_name": "euler"
-            }
-        },
+        "sampler": {"class_type": "KSampler",
+                    "inputs": {"model": ["ckpt", 0],
+                               "positive": ["pos", 0],
+                               "negative": ["neg", 0],
+                               "latent_image": ["enc", 0],
+                               "noise": ["noise", 0],
+                               "mask": ["enc", 1],
+                               "steps": 22,
+                               "cfg": 7.5,
+                               "sampler_name": "euler"}},
 
-        # 5) Decode and save
+        # Decode & save
         "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
         "out":    {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
     }
-
 
 def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
     wf = json.loads(
@@ -230,8 +239,11 @@ def styles():
 async def mask_test(file: UploadFile = File(...), mode: str = Form("preview")):
     _assert_env()
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
-    mask_b64 = call_mask_worker(b64_png(img), mode=mode)
-    mask_b64 = normalize_mask_b64(mask_b64)
+    # ask worker on original for best edges
+    mask_b64_raw = call_mask_worker(b64_png(img), mode=mode)
+    # resize & sanitize to a manageable preview size for a quick check
+    img_small = clamp_image(img, max_side=512)
+    mask_b64 = resize_mask_b64(mask_b64_raw, img_small.size)
     return {"mode": mode, "mask_b64": mask_b64}
 
 @app.post("/preview/json")
@@ -244,12 +256,15 @@ async def preview_json(
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
     prompt = build_prompt(style)
 
-    mask_b64 = call_mask_worker(b64_png(img), mode=mode)
-    mask_b64 = normalize_mask_b64(mask_b64)
-
+    # 1) Prepare preview image first (so we know target size for mask)
     img_small = clamp_image(img, max_side=1280)
-    img_b64_for_comfy = b64_jpeg(img_small, q=90)
+    img_b64_for_comfy = b64_png(img_small)  # PNG for robustness (can switch to JPEG later)
 
+    # 2) Mask from worker on full image, then resize/sanitize to preview size
+    mask_b64_raw = call_mask_worker(b64_png(img), mode=mode)
+    mask_b64 = resize_mask_b64(mask_b64_raw, img_small.size)
+
+    # 3) Generate 5 variations
     seeds = [secrets.randbits(32) for _ in range(5)]
     results = []
     for s in seeds:
@@ -269,11 +284,11 @@ async def preview_html(
     img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
     prompt = build_prompt(style)
 
-    mask_b64 = call_mask_worker(b64_png(img), mode=mode)
-    mask_b64 = normalize_mask_b64(mask_b64)
-
     img_small = clamp_image(img, max_side=1280)
-    img_b64_for_comfy = b64_jpeg(img_small, q=90)
+    img_b64_for_comfy = b64_png(img_small)
+
+    mask_b64_raw = call_mask_worker(b64_png(img), mode=mode)
+    mask_b64 = resize_mask_b64(mask_b64_raw, img_small.size)
 
     seeds = [secrets.randbits(32) for _ in range(5)]
     imgs64: List[str] = []
