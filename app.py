@@ -233,6 +233,50 @@ def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) ->
         raise HTTPException(status_code=502, detail=f"Comfy returned no images: {data}")
     return [e["image"] for e in images if isinstance(e, dict) and "image" in e]
 
+def call_exec_inpaint(img_b64: str, mask_b64: str, prompt: str, seed: int) -> list[str]:
+    """
+    Call the exec worker that takes base64 directly and returns base64 images.
+    Works with either /runsync or /run endpoints.
+    """
+    if not EXEC_ENDPOINT:
+        raise HTTPException(status_code=500, detail="RUNPOD_EXEC_ENDPOINT not set")
+
+    payload = {
+        "input": {
+            "image_b64": img_b64,
+            "mask_b64":  mask_b64,
+            "prompt":    prompt,
+            "seed":      seed,
+            "return_type": "base64"
+        }
+    }
+
+    ep = EXEC_ENDPOINT.rstrip("/")
+    if ep.endswith("/runsync"):
+        data = call_runpod(ep, payload)
+    elif ep.endswith("/run"):
+        data = runpod_run_and_wait(ep, payload)
+    else:
+        # assume runsync by default
+        data = call_runpod(ep, payload)
+
+    out = data.get("output") or {}
+    images = out.get("images", [])
+    # Some execs return straight list
+    if isinstance(out, list):
+        images = out
+    if not images:
+        raise HTTPException(status_code=502, detail=f"Exec worker returned no images: {data}")
+    # items can be dicts or raw strings; normalize
+    result = []
+    for e in images:
+        if isinstance(e, dict) and "image" in e:
+            result.append(e["image"])
+        elif isinstance(e, str):
+            result.append(e)
+    return result
+
+
 # -------------- Routes --------------
 @app.get("/debug/env")
 def debug_env():
@@ -258,21 +302,25 @@ async def mask_test(file: UploadFile = File(...), mode: str = Form("preview")):
 def _generate_variations(img: Image.Image, style: str, mode: str, n: int = 5) -> List[Dict[str, Any]]:
     prompt = build_prompt(style)
 
-    # 1) Get mask (raw base64 PNG)
+    # Mask: PNG raw base64
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
 
-    # 2) Prepare the main image as PNG **raw base64** (NO data: prefix)
+    # Main image: smaller PNG raw base64 (works best for exec)
     img_small = clamp_image(img, max_side=1280)
     img_png_b64 = b64_png(img_small)
 
     seeds = [secrets.randbits(32) for _ in range(n)]
     results: List[Dict[str, Any]] = []
     for s in seeds:
-        # pass raw base64 strings into the workflow replacements
-        imgs = call_comfy(img_png_b64, mask_b64, prompt, seed=s)
+        if USE_EXEC:
+            imgs = call_exec_inpaint(img_png_b64, mask_b64, prompt, seed=s)
+        else:
+            # falls back to Comfy workflow if you ever switch back
+            imgs = call_comfy(img_png_b64, mask_b64, prompt, seed=s)
         if imgs:
             results.append({"seed": s, "image_b64": imgs[0]})
     return results
+
 
 @app.post("/preview/json")
 async def preview_json(
