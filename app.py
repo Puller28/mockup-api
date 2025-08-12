@@ -21,6 +21,11 @@ COMFY_ENDPOINT   = os.getenv("RUNPOD_COMFY_ENDPOINT")    # .../<COMFY_ID>/run
 COMFY_MODEL      = os.getenv("RUNPOD_COMFY_MODEL", "v1-5-pruned-emaonly.safetensors")
 WARMUP_ENABLED   = os.getenv("WARMUP_ENABLED", "false").lower() == "true"
 
+# --- Exec (serverless) optional path ---
+EXEC_ENDPOINT   = os.getenv("RUNPOD_EXEC_ENDPOINT")         # e.g. .../<EXEC_ID>/runsync or /run
+USE_EXEC        = os.getenv("USE_EXEC", "false").lower() == "true"
+
+
 def _assert_env():
     missing = []
     if not RUNPOD_API_KEY: missing.append("RUNPOD_API_KEY")
@@ -79,6 +84,16 @@ def normalize_mask_b64(mask_b64: str) -> str:
         return base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception:
         return mask_b64
+    
+    def _strip_data_url(b64_or_data_url: str) -> str:
+    """If a 'data:image/...;base64,xxxx' string slips in, strip the header."""
+    if isinstance(b64_or_data_url, str) and b64_or_data_url.startswith("data:"):
+        try:
+            return b64_or_data_url.split(",", 1)[1]
+        except Exception:
+            return b64_or_data_url
+    return b64_or_data_url
+
 
 # ------------- HTTP helpers ---------------
 def _headers_json() -> Dict[str, str]:
@@ -115,6 +130,35 @@ def call_mask_worker(img_b64: str, mode: str = "preview") -> str:
     if not mask_b64:
         raise HTTPException(status_code=502, detail=f"Mask worker returned no mask: {data}")
     return normalize_mask_b64(mask_b64)
+
+def call_exec_worker(img_b64: str, mask_b64: str, prompt: str, seed: int) -> list[str]:
+    """Call the exec worker. Works with either /runsync or /run endpoints."""
+    if not EXEC_ENDPOINT:
+        raise HTTPException(status_code=500, detail="RUNPOD_EXEC_ENDPOINT not set but USE_EXEC is true.")
+
+    payload = {
+        "input": {
+            "image_b64": _strip_data_url(img_b64),
+            "mask_b64":  _strip_data_url(mask_b64),
+            "prompt":    prompt,
+            "seed":      int(seed),
+            "return_type": "base64"
+        }
+    }
+
+    if EXEC_ENDPOINT.rstrip("/").endswith("/runsync"):
+        data = call_runpod(EXEC_ENDPOINT, payload)
+    else:
+        data = runpod_run_and_wait(EXEC_ENDPOINT, payload)
+
+    out = data.get("output") or {}
+    images = out.get("images", [])
+    if not images and isinstance(out, list):               # defensive fallback
+        images = [{"image": x} for x in out]
+    if not images:
+        raise HTTPException(status_code=502, detail=f"Exec worker returned no images: {data}")
+    return [e["image"] for e in images if isinstance(e, dict) and "image" in e]
+
 
 # ---------- ComfyUI workflow ----------
 def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
@@ -284,9 +328,12 @@ def debug_env():
         "has_api_key": bool(RUNPOD_API_KEY),
         "mask_endpoint": MASK_ENDPOINT,
         "comfy_endpoint": COMFY_ENDPOINT,
+        "exec_endpoint": EXEC_ENDPOINT,           # NEW
+        "use_exec": USE_EXEC,                      # NEW
         "comfy_model": COMFY_MODEL,
         "warmup_enabled": WARMUP_ENABLED
     }
+
 
 @app.get("/styles")
 def styles():
@@ -300,26 +347,42 @@ async def mask_test(file: UploadFile = File(...), mode: str = Form("preview")):
     return {"mode": mode, "mask_b64": mask_b64}
 
 def _generate_variations(img: Image.Image, style: str, mode: str, n: int = 5) -> List[Dict[str, Any]]:
-    prompt = build_prompt(style)
-
-    # Mask: PNG raw base64
+    prompt   = build_prompt(style)
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
-
-    # Main image: smaller PNG raw base64 (works best for exec)
     img_small = clamp_image(img, max_side=1280)
-    img_png_b64 = b64_png(img_small)
+    # always ensure we send plain base64, not a data URL
+    img_b64_for_infer = _strip_data_url(b64_jpeg(img_small, q=90))
+    mask_b64 = _strip_data_url(mask_b64)
 
     seeds = [secrets.randbits(32) for _ in range(n)]
     results: List[Dict[str, Any]] = []
     for s in seeds:
         if USE_EXEC:
-            imgs = call_exec_inpaint(img_png_b64, mask_b64, prompt, seed=s)
+            imgs = call_exec_worker(img_b64_for_infer, mask_b64, prompt, seed=s)
         else:
-            # falls back to Comfy workflow if you ever switch back
-            imgs = call_comfy(img_png_b64, mask_b64, prompt, seed=s)
+            imgs = call_comfy(img_b64_for_infer, mask_b64, prompt, seed=s)
         if imgs:
             results.append({"seed": s, "image_b64": imgs[0]})
     return results
+
+# 1x1 transparent PNG
+_TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+
+@app.get("/warmup")
+def warmup():
+    if not WARMUP_ENABLED:
+        return {"ok": True, "skipped": True}
+    try:
+        call_runpod(MASK_ENDPOINT, {"input": {"image_b64": _TINY_PNG_B64, "mode": "preview"}})
+    except Exception:
+        pass
+    try:
+        if USE_EXEC and EXEC_ENDPOINT:
+            payload = {"input": {"image_b64": _TINY_PNG_B64, "mask_b64": _TINY_PNG_B64, "prompt": "warmup", "seed": 1, "return_type": "base64"}}
+            _ = call_runpod(EXEC_ENDPOINT, payload) if EXEC_ENDPOINT.endswith("/runsync") else runpod_run_and_wait(EXEC_ENDPOINT, payload)
+    except Exception:
+        pass
+    return {"ok": True, "warmed": True}
 
 
 @app.post("/preview/json")
