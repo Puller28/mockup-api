@@ -121,7 +121,7 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
     """
     Vanilla inpaint pipeline (works on stock Comfy):
       CheckpointLoaderSimple -> model/clip/vae
-      LoadImage + LoadImageMask
+      LoadImage + LoadImageMask (base64 objects)
       VAEEncodeForInpaint -> KSampler (mask-aware) -> VAEDecode -> SaveImage
     """
     return {
@@ -129,11 +129,31 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": COMFY_MODEL}
         },
-        "img":   {"class_type": "LoadImage",     "inputs": {"image": "__b64_img__"}},
-        "mask":  {"class_type": "LoadImageMask", "inputs": {"image": "__b64_mask__", "channel": "alpha"}},
+
+        # IMPORTANT: provide base64 as an object {image: "...", type: "base64"}
+        "img": {
+            "class_type": "LoadImage",
+            "inputs": {
+                "image": {"image": "__b64_img__", "type": "base64"}
+            }
+        },
+
+        "mask": {
+            "class_type": "LoadImageMask",
+            "inputs": {
+                "image": {"image": "__b64_mask__", "type": "base64"},
+                "channel": "alpha"
+            }
+        },
+
         "pos":   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["ckpt", 1]}},
         "neg":   {"class_type": "CLIPTextEncode", "inputs": {"text": "",      "clip": ["ckpt", 1]}},
-        "enc":   {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["img", 0], "mask": ["mask", 0], "vae": ["ckpt", 2]}},
+
+        "enc": {
+            "class_type": "VAEEncodeForInpaint",
+            "inputs": {"pixels": ["img", 0], "mask": ["mask", 0], "vae": ["ckpt", 2]}
+        },
+
         "noise": {"class_type": "RandomNoise", "inputs": {"seed": seed}},
         "sampler": {
             "class_type": "KSampler",
@@ -149,6 +169,7 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
                 "sampler_name": "euler"
             }
         },
+
         "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
         "out":    {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
     }
@@ -239,16 +260,16 @@ def _generate_variations(img: Image.Image, style: str, mode: str, n: int = 5) ->
 
     # 1) Get mask (raw base64 PNG)
     mask_b64 = call_mask_worker(b64_png(img), mode=mode)
-    # 2) Prepare PNG for Comfy and prefix as data URL (IMPORTANT)
+
+    # 2) Prepare the main image as PNG **raw base64** (NO data: prefix)
     img_small = clamp_image(img, max_side=1280)
     img_png_b64 = b64_png(img_small)
-    img_data_url  = f"data:image/png;base64,{img_png_b64}"
-    mask_data_url = f"data:image/png;base64,{mask_b64}"
 
     seeds = [secrets.randbits(32) for _ in range(n)]
     results: List[Dict[str, Any]] = []
     for s in seeds:
-        imgs = call_comfy(img_data_url, mask_data_url, prompt, seed=s)
+        # pass raw base64 strings into the workflow replacements
+        imgs = call_comfy(img_png_b64, mask_b64, prompt, seed=s)
         if imgs:
             results.append({"seed": s, "image_b64": imgs[0]})
     return results
