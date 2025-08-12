@@ -274,6 +274,91 @@ async def preview_json(
 
     return {"mode": mode, "style": style, "prompt_used": prompt, "count": len(results), "results": results}
 
+from fastapi import Query
+
+def _tiny_png_b64(size=64, invert=False) -> str:
+    # 64x64 checkerboard to avoid “empty” mask edge cases
+    im = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+    px = im.load()
+    for y in range(size):
+        for x in range(size):
+            v = 255 if ((x//8 + y//8) % 2 == (0 if not invert else 1)) else 0
+            px[x, y] = (v, v, v, 255)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+def _wf_variant(variant: str, model_name: str, img_b64: str, mask_b64: str):
+    """
+    Build 3 workflow variants to discover the exact input contract Comfy expects.
+    - A: LoadImage(image="<base64>")               -> VAEEncodeForInpaint (mask via ImageToMask)
+    - B: LoadImage(image={"image": "<base64>"})    -> VAEEncodeForInpaint (mask via ImageToMask)
+    - C: Same as A but force mask path explicitly
+    """
+    # common backbone
+    ckpt = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model_name}}
+    pos  = {"class_type": "CLIPTextEncode", "inputs": {"text": "test", "clip": ["ckpt", 1]}}
+    neg  = {"class_type": "CLIPTextEncode", "inputs": {"text": "",     "clip": ["ckpt", 1]}}
+    noise = {"class_type": "RandomNoise", "inputs": {"seed": 12345}}
+
+    if variant.upper() == "A":
+        img      = {"class_type": "LoadImage", "inputs": {"image": img_b64}}
+        mask_img = {"class_type": "LoadImage", "inputs": {"image": mask_b64}}
+
+    elif variant.upper() == "B":
+        img      = {"class_type": "LoadImage", "inputs": {"image": {"image": img_b64}}}
+        mask_img = {"class_type": "LoadImage", "inputs": {"image": {"image": mask_b64}}}
+
+    else:  # "C"
+        img      = {"class_type": "LoadImage", "inputs": {"image": img_b64}}
+        mask_img = {"class_type": "LoadImage", "inputs": {"image": mask_b64}}
+
+    wf = {
+        "ckpt": ckpt,
+        "img": img,
+        "mask_img": mask_img,
+        "to_mask": {"class_type": "ImageToMask", "inputs": {"image": ["mask_img", 0]}},
+        "pos": pos,
+        "neg": neg,
+        "enc": {"class_type": "VAEEncodeForInpaint",
+                "inputs": {"pixels": ["img", 0], "mask": ["to_mask", 0], "vae": ["ckpt", 2]}},
+        "noise": noise,
+        "sampler": {"class_type": "KSampler",
+                    "inputs": {"model": ["ckpt", 0], "positive": ["pos", 0], "negative": ["neg", 0],
+                               "latent_image": ["enc", 0], "noise": ["noise", 0],
+                               "mask": ["enc", 1], "steps": 5, "cfg": 4.0, "sampler_name": "euler"}},
+        "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
+        "out": {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
+    }
+    return wf
+
+@app.post("/debug/comfy-sanity")
+def debug_comfy_sanity(
+    variant: str = Query("A", description="A|B|C input shape test"),
+    model: str = Query(COMFY_MODEL, description="Checkpoint filename on the Comfy endpoint")
+):
+    _assert_env()
+    # create tiny test image & mask
+    img_b64  = _tiny_png_b64(64, invert=False)
+    mask_b64 = _tiny_png_b64(64, invert=True)
+
+    wf = _wf_variant(variant, model, img_b64, mask_b64)
+    payload = {"input": {"return_type": "base64", "workflow": wf}}
+
+    try:
+        data = call_runpod(COMFY_ENDPOINT, payload)
+    except HTTPException as e:
+        # return full error detail to us without swallowing it
+        return {"variant": variant, "error": True, "detail": e.detail}
+
+    return {
+        "variant": variant,
+        "status": data.get("status") or "OK",
+        "has_output_images": bool((data.get("output") or {}).get("images")),
+        "raw": data
+    }
+
+
 @app.post("/preview/html", response_class=HTMLResponse)
 async def preview_html(
     file: UploadFile = File(...),
