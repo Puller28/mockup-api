@@ -140,19 +140,40 @@ def call_mask_worker(img_b64: str, mode: str = "preview") -> str:
 
 # ---------- ComfyUI workflow ----------
 def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
+    """
+    Vanilla Comfy inpaint pipeline:
+      - CheckpointLoaderSimple -> model/clip/vae
+      - LoadImage (subject) + LoadImage (mask) -> ImageToMask
+      - VAEEncodeForInpaint(pixels, mask)
+      - KSampler(model, pos/neg, latent, noise, mask)
+      - VAEDecode -> SaveImage
+    """
     return {
+        # 0) Model / CLIP / VAE
         "ckpt": {
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": COMFY_MODEL}
         },
-        "img":   {"class_type": "LoadImage",     "inputs": {"image": "__b64_img__"}},
-        "mask":  {"class_type": "LoadImageMask", "inputs": {"image": "__b64_mask__", "channel": "alpha"}},
-        "pos":   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["ckpt", 1]}},
-        "neg":   {"class_type": "CLIPTextEncode", "inputs": {"text": "",      "clip": ["ckpt", 1]}},
+
+        # 1) Inputs
+        "img":      {"class_type": "LoadImage", "inputs": {"image": "__b64_img__"}},
+        # Load mask as a regular image (more tolerant than LoadImageMask)
+        "mask_img": {"class_type": "LoadImage", "inputs": {"image": "__b64_mask__"}},
+
+        # Convert mask image -> mask tensor inside Comfy (robust)
+        "to_mask":  {"class_type": "ImageToMask", "inputs": {"image": ["mask_img", 0]}},
+
+        # 2) Text encodes
+        "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["ckpt", 1]}},
+        "neg": {"class_type": "CLIPTextEncode", "inputs": {"text": "",      "clip": ["ckpt", 1]}},
+
+        # 3) Encode to latent with inpaint mask
         "enc": {
             "class_type": "VAEEncodeForInpaint",
-            "inputs": {"pixels": ["img", 0], "mask": ["mask", 0], "vae": ["ckpt", 2]}
+            "inputs": {"pixels": ["img", 0], "mask": ["to_mask", 0], "vae": ["ckpt", 2]}
         },
+
+        # 4) Sample
         "noise": {"class_type": "RandomNoise", "inputs": {"seed": seed}},
         "sampler": {
             "class_type": "KSampler",
@@ -168,9 +189,12 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
                 "sampler_name": "euler"
             }
         },
+
+        # 5) Decode and save
         "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
         "out":    {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
     }
+
 
 def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
     wf = json.loads(
