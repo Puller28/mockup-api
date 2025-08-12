@@ -152,6 +152,44 @@ def comfy_workflow(seed: int, prompt: str) -> Dict[str, Any]:
         "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["ckpt", 2]}},
         "out":    {"class_type": "SaveImage", "inputs": {"images": ["decode", 0]}}
     }
+def runpod_run_and_wait(endpoint_run: str, payload: dict, timeout_s: int = 240, poll_every: float = 1.5) -> dict:
+    """POST to /run, then poll /status/{id} until COMPLETED/FAILED."""
+    # submit
+    try:
+        r = requests.post(endpoint_run, headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"}, json=payload, timeout=60)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"RunPod request failed to {endpoint_run}: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"RunPod error from {endpoint_run}: {r.text}")
+
+    job = r.json()
+    job_id = job.get("id") or job.get("output", {}).get("id")
+    if not job_id:
+        raise HTTPException(status_code=502, detail=f"RunPod /run did not return a job id: {job}")
+
+    # poll
+    base = endpoint_run.rstrip("/").rsplit("/", 1)[0]  # strip "/run"
+    status_url = f"{base}/status/{job_id}"
+    started = time.time()
+
+    while True:
+        try:
+            s = requests.get(status_url, headers=_headers_json(), timeout=30)
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"RunPod status failed {status_url}: {e}")
+        if s.status_code != 200:
+            raise HTTPException(status_code=s.status_code, detail=f"RunPod status error {status_url}: {s.text}")
+
+        js = s.json()
+        st = (js.get("status") or "").upper()
+        if st in ("COMPLETED", "COMPLETEDWITHERROR"):
+            return js
+        if st in ("FAILED", "CANCELLED"):
+            raise HTTPException(status_code=502, detail=f"RunPod job failed {job_id}: {js}")
+        if time.time() - started > timeout_s:
+            raise HTTPException(status_code=504, detail=f"RunPod job timed out {job_id}")
+        time.sleep(poll_every)
+
 
 def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) -> List[str]:
     wf = json.loads(
@@ -160,7 +198,10 @@ def call_comfy(img_b64_for_comfy: str, mask_b64: str, prompt: str, seed: int) ->
         .replace("__b64_mask__", mask_b64)
     )
     payload = {"input": {"return_type": "base64", "workflow": wf}}
-    data = call_runpod(COMFY_ENDPOINT, payload)
+
+    # IMPORTANT: /run is async — wait for completion
+    data = runpod_run_and_wait(COMFY_ENDPOINT, payload)
+
     out = data.get("output") or {}
     images = out.get("images", [])
     if not images and isinstance(out, list):
