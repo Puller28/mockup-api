@@ -1,6 +1,4 @@
-# app.py — Outpainted Wall-Art Mockups (REST, multi-variant, ratio+mat, PNG/ZIP, size=auto)
-# Upload art -> protect art with mask -> OpenAI Images/edits paints room+frame around it.
-# Now supports generating multiple scene variants in one call.
+# app.py — Outpainted Wall-Art Mockups (REST, multi-variant, ratio+mat, PNG/ZIP hardened, size=auto)
 
 import io
 import os
@@ -11,7 +9,7 @@ from math import ceil
 from typing import Dict, Tuple, List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 
@@ -29,35 +27,29 @@ PRINT_SIZES: Dict[str, Tuple[int, int]] = {
     "A4":    (1654, 2339),
 }
 
-# Style keys map to prompts.
 STYLE_PROMPTS: Dict[str, str] = {
     "living_room": (
-        "Create a realistic interior mockup AROUND the existing artwork. "
-        "Keep the artwork exactly as-is. Paint a modern living room scene: "
-        "matte neutral wall with subtle texture, focused ceiling spotlight, "
-        "a thin black metal frame with correct perspective and natural shadows. "
-        "Minimalist, photorealistic, no text or logos."
+        "Create a realistic interior mockup AROUND the existing artwork. Keep the artwork exactly as-is. "
+        "Paint a modern living room: matte neutral wall with subtle texture, focused ceiling spotlight, "
+        "thin black metal frame with correct perspective and natural shadows. Minimalist, photorealistic, no text."
     ),
     "bedroom": (
-        "Around the existing artwork, paint a cozy bedroom scene: warm neutral wall, soft daylight, "
-        "light wood frame around the artwork, gentle shadows, photorealistic, no text or logos."
+        "Around the existing artwork, paint a cozy bedroom: warm neutral wall, soft daylight, "
+        "light wood frame around the artwork, gentle shadows. Photorealistic, no text or logos."
     ),
     "study": (
-        "Around the existing artwork, paint a refined study/home office: desaturated wall paint, "
-        "subtle bookshelf blur and desk hints, muted daylight from the left, "
-        "thin dark metal frame, soft realistic shadows. No text or logos."
+        "Around the existing artwork, paint a refined study / home office: desaturated wall paint, "
+        "subtle bookshelf blur and desk hints, muted daylight, thin dark metal frame, soft realistic shadows. No text."
     ),
     "gallery": (
         "Paint a clean gallery wall around the existing artwork: white wall with subtle microtexture, "
         "museum track lighting from above, thin black metal frame, natural falloff shadows. No text."
     ),
     "kitchen": (
-        "Around the existing artwork, paint a tasteful kitchen nook: light painted wall, "
-        "subtle tile or counter hints, soft daylight, thin black frame, realistic shadows. No text."
+        "Around the existing artwork, paint a tasteful kitchen nook: light painted wall, subtle tile / counter hints, "
+        "soft daylight, thin black frame, realistic shadows. No text."
     ),
 }
-
-# Default multi-variant set
 DEFAULT_STYLE_LIST = ["living_room", "bedroom", "study", "gallery", "kitchen"]
 
 
@@ -65,9 +57,8 @@ DEFAULT_STYLE_LIST = ["living_room", "bedroom", "study", "gallery", "kitchen"]
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.4")
+app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.5")
 
-# Open CORS for easy testing; tighten in prod.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -97,10 +88,7 @@ def _resize_fit(img: Image.Image, target: Tuple[int, int]) -> Image.Image:
     return ImageOps.contain(img, target, Image.LANCZOS)
 
 def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0)):
-    """
-    Pads image (no crop) to the given aspect ratio by adding transparent borders.
-    Returns (padded_img, placed_bbox) where placed_bbox=(x0,y0,x1,y1) of original on new canvas.
-    """
+    """Pad (no crop) to ratio_w:ratio_h by adding transparent borders."""
     img = img.convert("RGBA")
     w, h = img.size
     target_ratio = ratio_w / ratio_h
@@ -112,11 +100,9 @@ def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0))
         return canvas, (0, 0, w, h)
 
     if src_ratio > target_ratio:
-        # wider than target: extend height
         canvas_w = w
         canvas_h = ceil(w / target_ratio)
     else:
-        # taller than target: extend width
         canvas_h = h
         canvas_w = ceil(h * target_ratio)
 
@@ -126,16 +112,9 @@ def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0))
     canvas.paste(img, (x0, y0), img)
     return canvas, (x0, y0, x0 + w, y0 + h)
 
-def _pad_canvas_keep_center(img: Image.Image,
-                            pad_ratio: float,
-                            target_side: int):
-    """
-    Optionally upscales the art to target_side (longest edge),
-    then adds border space around it (pad_ratio of max side).
-    Returns (canvas_rgba, art_bbox_on_canvas).
-    """
+def _pad_canvas_keep_center(img: Image.Image, pad_ratio: float, target_side: int):
+    """Upscale to target_side (max edge) then add border by pad_ratio; returns (canvas, art_bbox)."""
     img = img.convert("RGBA")
-
     longest = max(img.size)
     scale = max(1.0, target_side / float(longest))
     if scale > 1.0:
@@ -148,39 +127,29 @@ def _pad_canvas_keep_center(img: Image.Image,
     canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
     x0, y0 = border, border
     canvas.paste(img, (x0, y0), img)
-
     return canvas, (x0, y0, x0 + w, y0 + h)
 
 def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int, int, int]) -> Image.Image:
     """
     Correct for Images Edits API:
-      - Transparent = PAINT (model edits here)  -> the border around the art
-      - Opaque      = KEEP  (preserve content)  -> the original artwork region
+      - Transparent = PAINT (model edits here) -> the border around the art
+      - Opaque      = KEEP  (preserve content) -> the original artwork region
     """
     W, H = canvas_size
     x0, y0, x1, y1 = keep_bbox
-
-    # Allow painting everywhere...
     mask = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    # ...except over the artwork (keep opaque).
     keep_block = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 255))
     mask.paste(keep_block, (x0, y0))
     return mask
 
-# ---- OpenAI Images/edits via REST (version-proof) ----
-def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str = "auto") -> str:
-    """
-    Calls https://api.openai.com/v1/images/edits (multipart).
-    Text fields go in `data`, binaries in `files`. Returns first image's base64.
-    Uses size='auto' by default so any aspect ratio works.
-    """
+def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str = "auto") -> str:
+    """Call OpenAI Images/edits with multipart. Returns first image's base64."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set on server")
 
     url = "https://api.openai.com/v1/images/edits"
     headers = {"Authorization": f"Bearer {api_key}"}
-
     org_id = os.getenv("OPENAI_ORG_ID")
     if org_id:
         headers["OpenAI-Organization"] = org_id
@@ -208,34 +177,43 @@ def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: s
         raise HTTPException(status_code=502, detail=f"Image API returned no data: {js}")
     return js["data"][0]["b64_json"]
 
+def _build_zip_bytes(files_to_add: List[Tuple[str, bytes]]) -> bytes:
+    """
+    Build a valid ZIP (in-memory) and return its raw bytes.
+    files_to_add: list of (filename, binary_bytes)
+    """
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files_to_add:
+            zf.writestr(name, data)
+    # IMPORTANT: fetch raw bytes AFTER the context manager closes (central directory written).
+    return mem.getvalue()
+
 
 # =========================
-# Route: outpaint mockup (multi-variant)
+# Route
 # =========================
 
 @app.post("/outpaint/mockup")
 async def outpaint_mockup(
     file: UploadFile = File(...),
-    # one or many styles: comma-separated keys from STYLE_PROMPTS
-    styles: str = Form(",".join(DEFAULT_STYLE_LIST)),
+    styles: str = Form(",".join(DEFAULT_STYLE_LIST)),   # comma-separated list of style keys
     target_px: int = Form(DEFAULT_TARGET_PX),
     pad_ratio: float = Form(0.42),
-    make_print_previews: int = Form(1),      # 1=yes, 0=no
-    normalize_ratio: str = Form(""),         # e.g. "4:5", "3:4", "2:3" ("" = keep original aspect)
-    mat_pct: float = Form(0.0),              # e.g., 0.03 for 3% inner margin
-    return_format: str = Form("json"),       # "json" | "png" | "zip"
-    filename: str = Form("mockup_bundle"),   # base filename for png/zip
+    make_print_previews: int = Form(1),                 # 1=yes, 0=no
+    normalize_ratio: str = Form(""),                    # e.g. "4:5", "3:4", "2:3" ("" = keep aspect)
+    mat_pct: float = Form(0.0),                         # e.g., 0.03 for 3% inner margin
+    return_format: str = Form("json"),                  # "json" | "png" | "zip"
+    filename: str = Form("mockup_bundle"),
 ):
     """
-    Upload a piece of art; API paints a realistic room + thin frame around it.
-    - styles: comma-separated (e.g., "living_room,bedroom,study,gallery,kitchen")
-    - normalize_ratio: force art to a given print ratio (pads only; no crop)
-    - mat_pct: inner margin inside frame (0–0.1 typical)
-    - return_format: "json" (default), "png" (first style only), or "zip" (all styles)
-    Returns either JSON with all images, a single PNG, or a ZIP containing everything.
+    Generate one or many mockups in one call:
+      - styles: e.g., "living_room,bedroom,study,gallery,kitchen"
+      - normalize_ratio: pad your art to a print ratio first (no crop)
+      - mat_pct: inner margin inside the frame (0–0.1)
+      - return_format: 'json' (base64), 'png' (first style), or 'zip' (all styles + previews)
     """
-
-    # Parse + validate styles
+    # Parse & validate styles
     style_list = [s.strip() for s in styles.split(",") if s.strip()]
     invalid = [s for s in style_list if s not in STYLE_PROMPTS]
     if invalid:
@@ -243,13 +221,13 @@ async def outpaint_mockup(
     if not style_list:
         raise HTTPException(400, "No valid styles provided.")
 
-    # 1) Read art
+    # Load art
     try:
         art = Image.open(io.BytesIO(await file.read())).convert("RGBA")
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
-    # 1a) (optional) normalize to a requested print ratio (pad only)
+    # Normalize ratio (optional)
     if normalize_ratio:
         try:
             rw, rh = [int(x) for x in normalize_ratio.split(":")]
@@ -257,7 +235,7 @@ async def outpaint_mockup(
         except Exception:
             raise HTTPException(400, f"Invalid normalize_ratio '{normalize_ratio}'. Use like '4:5', '3:4', '2:3'.")
 
-    # 1b) (optional) inner mat (shrink visible art a bit to avoid frame touch)
+    # Inner mat (optional)
     if mat_pct and mat_pct > 0:
         w, h = art.size
         mx = int(w * mat_pct / 2.0)
@@ -266,30 +244,39 @@ async def outpaint_mockup(
         mat_canvas.paste(art, (mx, my), art)
         art = mat_canvas
 
-    # --- Build shared canvas + mask once (saves time); reuse for each style ---
+    # Build shared canvas + mask (reused across styles)
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
     canvas_bytes = _img_to_png_bytes(canvas)
     mask_bytes = _img_to_png_bytes(mask)
 
-    # 2) Generate each style
+    # Generate per style
     results: List[Dict[str, str]] = []
     for style_key in style_list:
         prompt = STYLE_PROMPTS[style_key]
-        b64 = images_edit_rest(
-            image_bytes=canvas_bytes,
-            mask_bytes=mask_bytes,
-            prompt=prompt,
-            size="auto",  # robust for any aspect ratio
-        )
+        try:
+            b64 = _openai_images_edit(canvas_bytes, mask_bytes, prompt=prompt, size="auto")
+        except HTTPException as e:
+            # Continue other styles; include error marker for visibility in JSON
+            results.append({"style": style_key, "error": str(e.detail)})
+            continue
         results.append({"style": style_key, "image_b64": b64})
 
-    # 3) Optional previews per result
+    # If all failed, bail with useful message
+    if not any("image_b64" in r for r in results):
+        raise HTTPException(status_code=502, detail={"message": "No mockups generated", "results": results})
+
+    # Build previews map (optional)
     previews_map: Dict[str, Dict[str, str]] = {}
     if make_print_previews:
         for item in results:
+            if "image_b64" not in item:
+                continue
             key = item["style"]
-            img = Image.open(io.BytesIO(base64.b64decode(item["image_b64"]))).convert("RGBA")
+            try:
+                img = Image.open(io.BytesIO(base64.b64decode(item["image_b64"]))).convert("RGBA")
+            except Exception:
+                continue
             previews: Dict[str, str] = {}
             for name, wh in PRINT_SIZES.items():
                 thumb = _resize_fit(img, wh)
@@ -298,26 +285,36 @@ async def outpaint_mockup(
                 previews[name] = base64.b64encode(buf.getvalue()).decode("utf-8")
             previews_map[key] = previews
 
-    # 4) Return (json / png / zip)
+    # ---------- Return formats ----------
     if return_format.lower() == "png":
-        # return first style as direct PNG
-        first = results[0]
-        img_bytes = base64.b64decode(first["image_b64"])
-        headers = {"Content-Disposition": f'inline; filename="{filename}_{first["style"]}.png"'}
-        return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png", headers=headers)
+        # first successful style as PNG
+        first_ok = next((r for r in results if "image_b64" in r), None)
+        img_bytes = base64.b64decode(first_ok["image_b64"])
+        headers = {"Content-Disposition": f'inline; filename="{filename}_{first_ok["style"]}.png"'}
+        return Response(content=img_bytes, media_type="image/png", headers=headers)
 
     if return_format.lower() == "zip":
-        mem = io.BytesIO()
-        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for item in results:
-                key = item["style"]
-                zf.writestr(f"{filename}_{key}.png", base64.b64decode(item["image_b64"]))
-                if make_print_previews and key in previews_map:
-                    for pname, pb64 in previews_map[key].items():
-                        zf.writestr(f"{filename}_{key}_preview_{pname}.png", base64.b64decode(pb64))
-        mem.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="{filename}.zip"'}
-        return StreamingResponse(mem, media_type="application/zip", headers=headers)
+        files_to_add: List[Tuple[str, bytes]] = []
+        # master images
+        for item in results:
+            if "image_b64" in item:
+                files_to_add.append((f'{filename}_{item["style"]}.png', base64.b64decode(item["image_b64"])))
+        # previews
+        if make_print_previews and previews_map:
+            for style_key, pv in previews_map.items():
+                for name, b64s in pv.items():
+                    files_to_add.append((f"{filename}_{style_key}_preview_{name}.png", base64.b64decode(b64s)))
+
+        if not files_to_add:
+            raise HTTPException(status_code=502, detail="Nothing to add to ZIP (no successful images).")
+
+        zip_bytes = _build_zip_bytes(files_to_add)
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}.zip"',
+            "Content-Length": str(len(zip_bytes)),
+        }
+        # Return as full bytes (not a streaming iterator) to avoid corrupt/empty zips in some clients
+        return Response(content=zip_bytes, media_type="application/zip", headers=headers)
 
     # default JSON
     payload = {
@@ -327,7 +324,7 @@ async def outpaint_mockup(
         "normalize_ratio": normalize_ratio,
         "mat_pct": mat_pct,
         "api_size": "auto",
-        "results": results,           # [{style, image_b64}]
+        "results": results,           # [{style, image_b64? , error?}]
         "previews": previews_map,     # {style: {size_name: b64, ...}}
     }
     return JSONResponse(payload)
