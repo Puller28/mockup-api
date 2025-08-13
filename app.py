@@ -138,16 +138,22 @@ def _pad_canvas_keep_center(img: Image.Image,
 
 def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int, int, int]) -> Image.Image:
     """
-    Mask for Images Edits API:
-      - Transparent = KEEP (the original artwork)
-      - Opaque      = PAINT (room + frame around)
+    Correct for Images Edits API:
+      - Transparent = PAINT (model edits here)  -> the border around the art
+      - Opaque      = KEEP  (preserve content)  -> the original artwork region
     """
     W, H = canvas_size
-    mask = Image.new("RGBA", (W, H), (0, 0, 0, 255))
     x0, y0, x1, y1 = keep_bbox
-    hole = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
-    mask.paste(hole, (x0, y0))
+
+    # Start fully transparent so the model can PAINT the room everywhere...
+    mask = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # ...then paste an OPAQUE block where the artwork is, so it is KEPT.
+    keep_block = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 255))
+    mask.paste(keep_block, (x0, y0))
+
     return mask
+
 
 # ---- OpenAI Images/edits via REST (version-proof) ----
 def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str = "auto") -> str:
