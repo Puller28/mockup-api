@@ -1,56 +1,57 @@
-# app.py — Outpainted Wall-Art Mockups (single file)
-# Upload art -> we protect it with a mask -> GPT Image API outpaints a room+frame around it.
+# app.py — Outpainted Wall-Art Mockups (REST version, Render-friendly)
+# Upload art -> we protect the art with a mask -> OpenAI Images/edits outpaints a room+frame around it.
 
-import os, io, base64
+import io
+import os
+import base64
+import requests
 from typing import Dict, Tuple
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
-from openai import OpenAI
 
-# ---------------- Config ----------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Set OPENAI_API_KEY in env")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# =========================
+# Config / Presets
+# =========================
 
-# Generation resolution; 1536–3072 are reasonable. 2048 is a good default.
-DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))
-
-# Optional size presets (approx). We return previews for these if requested.
+DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))  # generation canvas long side
 PRINT_SIZES: Dict[str, Tuple[int, int]] = {
     "4x5":   (1600, 2000),
     "3x4":   (1536, 2048),
     "2x3":   (1600, 2400),
     "11x14": (1650, 2100),
-    "A4":    (1654, 2339),  # ~300 DPI
+    "A4":    (1654, 2339),
 }
 
-# Style prompts — keep them tight and literal to avoid clutter.
 STYLE_PROMPTS: Dict[str, str] = {
     "modern_living_black_frame_spotlit": (
         "Create a realistic interior mockup AROUND the existing artwork. "
         "Keep the artwork exactly as-is. Paint a modern living room scene: "
-        "matte neutral wall with subtle texture, evening ambience, a focused ceiling spotlight, "
-        "a thin black metal frame around the artwork with correct perspective and natural shadows. "
-        "No text, no extra logos, tasteful minimalist styling."
+        "matte neutral wall with subtle texture, focused ceiling spotlight, "
+        "thin black metal frame around the artwork with correct perspective and natural shadows. "
+        "Minimalist, photorealistic, no text or logos."
     ),
     "gallery_white": (
         "Create a clean gallery wall around the existing artwork. White wall with subtle texture, "
-        "museum lighting from above, thin black frame, soft shadows, no text or labels."
+        "museum lighting from above, thin black frame, soft shadows, no text."
     ),
     "bedroom_soft_wood": (
-        "Around the existing artwork, paint a cozy bedroom scene: warm neutral wall, soft daylight, "
-        "light wood frame, gentle shadows. Keep the artwork unchanged."
+        "Around the existing artwork, paint a cozy bedroom: warm neutral wall, soft daylight, "
+        "light wood frame, gentle shadows. Keep the artwork unchanged, no text."
     ),
 }
 
-# ---------------- App ----------------
-app = FastAPI(title="Outpainted Wall-Art Mockups", version="1.0")
 
-# (Optional) relax CORS for testing
+# =========================
+# FastAPI app
+# =========================
+
+app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.1")
+
+# Open CORS for easy testing; tighten in prod.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -59,29 +60,35 @@ app.add_middleware(
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "styles": list(STYLE_PROMPTS.keys())}
+    return {
+        "ok": True,
+        "styles": list(STYLE_PROMPTS.keys()),
+        "target_default": DEFAULT_TARGET_PX,
+    }
 
-# ---------------- Helpers ----------------
+
+# =========================
+# Helpers
+# =========================
+
 def _img_to_png_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
 
 def _resize_fit(img: Image.Image, target: Tuple[int, int]) -> Image.Image:
-    # Preserve aspect ratio; fit INSIDE the target box.
     return ImageOps.contain(img, target, Image.LANCZOS)
 
 def _pad_canvas_keep_center(img: Image.Image,
                             pad_ratio: float,
                             target_side: int) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
-    - Optionally upscales the art to target_side (longest edge)
-    - Adds a border pad around it (pad_ratio of max dimension)
-    - Returns (padded_canvas_RGBA, bbox_of_art_on_canvas)
+    Optionally upscales the art to target_side (longest edge),
+    then adds border space around it (pad_ratio of max side).
+    Returns (canvas_rgba, art_bbox_on_canvas).
     """
     img = img.convert("RGBA")
 
-    # Upscale small originals a bit so the model has pixels to work with
     longest = max(img.size)
     scale = max(1.0, target_side / float(longest))
     if scale > 1.0:
@@ -99,79 +106,116 @@ def _pad_canvas_keep_center(img: Image.Image,
 
 def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int, int, int]) -> Image.Image:
     """
-    For the Images Edits API:
-    - Transparent = KEEP original (the art)
-    - Opaque      = PAINT new content (the border/room)
+    Mask for Images Edits API:
+      - Transparent pixels = KEEP (the original artwork)
+      - Opaque pixels      = PAINT (room + frame around)
     """
     W, H = canvas_size
     mask = Image.new("RGBA", (W, H), (0, 0, 0, 255))  # paint everywhere
     x0, y0, x1, y1 = keep_bbox
-    hole = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))  # transparent hole
+    hole = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
     mask.paste(hole, (x0, y0))
     return mask
 
-# ---------------- Route ----------------
+
+# ---- OpenAI Images/edits via REST (version-proof) ----
+def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str) -> str:
+    """
+    Calls https://api.openai.com/v1/images/edits with multipart form.
+    Returns the first image's base64 string. Raises HTTPException on error.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set on server")
+
+    url = "https://api.openai.com/v1/images/edits"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    files = {
+        "model": ("", "gpt-image-1"),
+        "prompt": ("", prompt),
+        "size": ("", size),
+        "image": ("canvas.png", image_bytes, "image/png"),
+        "mask": ("mask.png", mask_bytes, "image/png"),
+        # add "n": ("", "1") if you ever want multiple
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, files=files, timeout=180)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Images API request failed: {e}")
+
+    if resp.status_code != 200:
+        # Surface raw API error for easy debugging in Render logs
+        raise HTTPException(status_code=502, detail=f"Image API error [{resp.status_code}]: {resp.text}")
+
+    data = resp.json()
+    if not data.get("data"):
+        raise HTTPException(status_code=502, detail=f"Image API returned no data: {data}")
+    return data["data"][0]["b64_json"]
+
+
+# =========================
+# Route: outpaint mockup
+# =========================
+
 @app.post("/outpaint/mockup")
 async def outpaint_mockup(
     file: UploadFile = File(...),
     style_key: str = Form("modern_living_black_frame_spotlit"),
-    target_px: int = Form(DEFAULT_TARGET_PX),     # output canvas (square) long side
-    pad_ratio: float = Form(0.42),                # how much room around the art (0.35–0.5 typical)
-    make_print_previews: int = Form(1)            # 1 = include PRINT_SIZES previews in response
+    target_px: int = Form(DEFAULT_TARGET_PX),
+    pad_ratio: float = Form(0.42),
+    make_print_previews: int = Form(1)  # 1=yes, 0=no
 ):
     """
-    Upload a piece of art; we generate a realistic room + frame around it.
-    Returns a PNG (base64) and optional previews for common print sizes.
+    Upload a piece of art; the API paints a realistic room + thin frame around it.
+    Returns a master PNG (base64) and optional print-size previews.
     """
     if style_key not in STYLE_PROMPTS:
         raise HTTPException(400, f"Unknown style_key. Choose one of: {list(STYLE_PROMPTS)}")
 
+    # 1) Read art
     try:
         art = Image.open(io.BytesIO(await file.read())).convert("RGBA")
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
-    # 1) Prepare padded canvas and mask (protect original art)
+    # 2) Build padded canvas and KEEP mask
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
 
     canvas_bytes = _img_to_png_bytes(canvas)
     mask_bytes = _img_to_png_bytes(mask)
 
-    # 2) Call Images API (edits / outpainting)
+    # 3) Call OpenAI Images/edits (REST)
     prompt = STYLE_PROMPTS[style_key]
-    try:
-        resp = client.images.edits(
-            model="gpt-image-1",
-            image=canvas_bytes,
-            mask=mask_bytes,
-            prompt=prompt,
-            size=f"{canvas.width}x{canvas.height}",
-            n=1
-        )
-    except Exception as e:
-        raise HTTPException(502, f"Image API error: {e}")
+    b64 = images_edit_rest(
+        image_bytes=canvas_bytes,
+        mask_bytes=mask_bytes,
+        prompt=prompt,
+        size=f"{canvas.width}x{canvas.height}",
+    )
 
-    b64 = resp.data[0].b64_json
-    outpainted = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+    # 4) Decode master + generate optional previews
+    master = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
 
-    # 3) Optional print-size previews
     previews: Dict[str, str] = {}
     if make_print_previews:
         for name, wh in PRINT_SIZES.items():
-            img = _resize_fit(outpainted, wh)
-            buf = io.BytesIO(); img.save(buf, "PNG")
+            img = _resize_fit(master, wh)
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
             previews[name] = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    # 4) Return JSON (master + previews)
-    master_buf = io.BytesIO()
-    outpainted.save(master_buf, "PNG")
-    master_b64 = base64.b64encode(master_buf.getvalue()).decode("utf-8")
+    # 5) Respond
+    buf_master = io.BytesIO()
+    master.save(buf_master, "PNG")
+    master_b64 = base64.b64encode(buf_master.getvalue()).decode("utf-8")
 
     return JSONResponse({
         "style": style_key,
         "canvas_size": [canvas.width, canvas.height],
-        "art_bbox": keep_bbox,   # (x0, y0, x1, y1) of the protected art region
+        "art_bbox": keep_bbox,  # (x0, y0, x1, y1) where the original art was preserved
         "image_b64": master_b64,
         "previews": previews
     })
