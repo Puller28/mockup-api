@@ -30,9 +30,18 @@ def _assert_env():
     missing = []
     if not RUNPOD_API_KEY: missing.append("RUNPOD_API_KEY")
     if not MASK_ENDPOINT:  missing.append("RUNPOD_MASK_ENDPOINT")
-    if not COMFY_ENDPOINT: missing.append("RUNPOD_COMFY_ENDPOINT")
+
+    # Option A (exec) takes precedence when USE_EXEC = true
+    if USE_EXEC:
+        if not EXEC_ENDPOINT:
+            missing.append("RUNPOD_EXEC_ENDPOINT")
+    else:
+        if not COMFY_ENDPOINT:
+            missing.append("RUNPOD_COMFY_ENDPOINT")
+
     if missing:
         raise HTTPException(status_code=500, detail=f"Missing env: {', '.join(missing)}")
+
 
 # ------------- Style presets ---------------
 STYLE_PRESETS: Dict[str, str] = {
@@ -132,20 +141,64 @@ def call_mask_worker(img_b64: str, mode: str = "preview") -> str:
         raise HTTPException(status_code=502, detail=f"Mask worker returned no mask: {data}")
     return normalize_mask_b64(mask_b64)
 
-def call_exec_worker(img_b64: str, mask_b64: str, prompt: str, seed: int) -> list[str]:
-    """Call the exec worker. Works with either /runsync or /run endpoints."""
+# ---------- Exec worker (renderer) ----------
+def call_exec(img_b64: str, mask_b64: str, prompt: str, seed: int | None = None) -> list[str]:
+    """
+    Calls your RunPod EXEC worker (serverless handler that accepts base64).
+    Supports /runsync or /run depending on EXEC_ENDPOINT.
+    """
     if not EXEC_ENDPOINT:
-        raise HTTPException(status_code=500, detail="RUNPOD_EXEC_ENDPOINT not set but USE_EXEC is true.")
+        raise HTTPException(status_code=500, detail="RUNPOD_EXEC_ENDPOINT not set")
 
     payload = {
         "input": {
-            "image_b64": _strip_data_url(img_b64),
-            "mask_b64":  _strip_data_url(mask_b64),
-            "prompt":    prompt,
-            "seed":      int(seed),
-            "return_type": "base64"
+            "image_b64": img_b64,
+            "mask_b64":  mask_b64,
+            "prompt":    prompt
         }
     }
+    if seed is not None:
+        payload["input"]["seed"] = int(seed)
+
+    ep = EXEC_ENDPOINT.rstrip("/")
+    if ep.endswith("/runsync"):
+        data = call_runpod(ep, payload)
+    elif ep.endswith("/run"):
+        data = runpod_run_and_wait(ep, payload)
+    else:
+        # default to runsync if suffix unknown
+        data = call_runpod(ep, payload)
+
+    out = data.get("output") or {}
+    # common returns: {"output":{"image_b64": "..."}}
+    if isinstance(out, dict) and "image_b64" in out:
+        return [out["image_b64"]]
+    # or {"output":{"images":[{"image":"..."}, ...]}}
+    if isinstance(out, dict) and "images" in out:
+        return [x["image"] if isinstance(x, dict) and "image" in x else x for x in out["images"]]
+    # or {"output": ["...", "..."]}
+    if isinstance(out, list):
+        return out
+
+    raise HTTPException(status_code=502, detail=f"Exec worker returned no images: {data}")
+
+
+    data = call_runpod(COMFY_ENDPOINT, payload)  # COMFY_ENDPOINT now points to EXEC /runsync
+
+    # Common shapes:
+    # 1) {"output": {"image_b64": "..."}}
+    # 2) {"output": {"images": [{"image": "..."}, ...]}}
+    # 3) {"output": ["...", "..."]}
+    out = data.get("output") or {}
+    if isinstance(out, dict) and "image_b64" in out:
+        return [out["image_b64"]]
+    if isinstance(out, dict) and "images" in out:
+        return [x["image"] if isinstance(x, dict) and "image" in x else x for x in out["images"]]
+    if isinstance(out, list):
+        return out
+
+    raise HTTPException(status_code=502, detail=f"Exec worker returned no images: {data}")
+
 
     if EXEC_ENDPOINT.rstrip("/").endswith("/runsync"):
         data = call_runpod(EXEC_ENDPOINT, payload)
@@ -329,11 +382,13 @@ def debug_env():
         "has_api_key": bool(RUNPOD_API_KEY),
         "mask_endpoint": MASK_ENDPOINT,
         "comfy_endpoint": COMFY_ENDPOINT,
-        "exec_endpoint": EXEC_ENDPOINT,           # NEW
-        "use_exec": USE_EXEC,                      # NEW
+        "exec_endpoint": EXEC_ENDPOINT,
+        "use_exec": USE_EXEC,
+        "active_render_endpoint": EXEC_ENDPOINT if USE_EXEC else COMFY_ENDPOINT,
         "comfy_model": COMFY_MODEL,
         "warmup_enabled": WARMUP_ENABLED
     }
+
 
 
 @app.get("/styles")
@@ -348,23 +403,24 @@ async def mask_test(file: UploadFile = File(...), mode: str = Form("preview")):
     return {"mode": mode, "mask_b64": mask_b64}
 
 def _generate_variations(img: Image.Image, style: str, mode: str, n: int = 5) -> List[Dict[str, Any]]:
-    prompt   = build_prompt(style)
-    mask_b64 = call_mask_worker(b64_png(img), mode=mode)
-    img_small = clamp_image(img, max_side=1280)
-    # always ensure we send plain base64, not a data URL
-    img_b64_for_infer = _strip_data_url(b64_jpeg(img_small, q=90))
-    mask_b64 = _strip_data_url(mask_b64)
+    prompt = build_prompt(style)
 
+    # 1) Mask: best edges when we send PNG of the original
+    mask_b64 = call_mask_worker(b64_png(img), mode=mode)
+
+    # 2) Exec worker inference image: clamp + JPEG to keep payload small
+    img_small = clamp_image(img, max_side=1280)
+    img_b64_for_infer = b64_jpeg(img_small, q=90)
+
+    # 3) Generate N variations by seeding
     seeds = [secrets.randbits(32) for _ in range(n)]
     results: List[Dict[str, Any]] = []
     for s in seeds:
-        if USE_EXEC:
-            imgs = call_exec_worker(img_b64_for_infer, mask_b64, prompt, seed=s)
-        else:
-            imgs = call_comfy(img_b64_for_infer, mask_b64, prompt, seed=s)
+        imgs = call_exec(img_b64_for_infer, mask_b64, prompt, seed=s)  # EXEC worker
         if imgs:
             results.append({"seed": s, "image_b64": imgs[0]})
     return results
+
 
 # 1x1 transparent PNG
 _TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
@@ -430,18 +486,4 @@ async def preview_zip(
     headers = {"Content-Disposition": "attachment; filename=mockups.zip"}
     return StreamingResponse(mem, media_type="application/zip", headers=headers)
 
-# (Optional) warmup endpoint - off unless WARMUP_ENABLED = true
-@app.get("/warmup")
-def warmup():
-    if not WARMUP_ENABLED:
-        return {"ok": True, "skipped": True}
-    try:
-        # tiny noop calls just to keep both workers warm
-        call_runpod(MASK_ENDPOINT, {"input": {"image_b64": "", "mode": "preview"}})
-    except Exception:
-        pass
-    try:
-        call_runpod(COMFY_ENDPOINT, {"input": {"return_type": "base64", "workflow": {}}})
-    except Exception:
-        pass
-    return {"ok": True, "warmed": True}
+

@@ -1,0 +1,17 @@
+{
+  "input": {
+    "return_type": "base64",
+    "workflow": {
+      "img": {
+        "class_type": "LoadImage",
+        "inputs": {
+          "image": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/lnp5hQAAAAASUVORK5CYII="
+        }
+      },
+      "out": {
+        "class_type": "SaveImage",
+        "inputs": { "images": ["img", 0] }
+      }
+    }
+  }
+}
