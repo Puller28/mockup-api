@@ -122,7 +122,7 @@ def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int
 def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str) -> str:
     """
     Calls https://api.openai.com/v1/images/edits with multipart form.
-    Returns the first image's base64 string. Raises HTTPException on error.
+    Text fields go in `data`, binary images go in `files`.
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -131,28 +131,32 @@ def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: s
     url = "https://api.openai.com/v1/images/edits"
     headers = {"Authorization": f"Bearer {api_key}"}
 
+    # Text fields must be in `data`
+    data = {
+        "model": "gpt-image-1",
+        "prompt": prompt,
+        "size": size,          # e.g., "2048x2048"
+        # "n": "1",            # optional
+    }
+
+    # Binary parts go in `files`
     files = {
-        "model": ("", "gpt-image-1"),
-        "prompt": ("", prompt),
-        "size": ("", size),
         "image": ("canvas.png", image_bytes, "image/png"),
-        "mask": ("mask.png", mask_bytes, "image/png"),
-        # add "n": ("", "1") if you ever want multiple
+        "mask":  ("mask.png",   mask_bytes,  "image/png"),
     }
 
     try:
-        resp = requests.post(url, headers=headers, files=files, timeout=180)
+        resp = requests.post(url, headers=headers, data=data, files=files, timeout=180)
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Images API request failed: {e}")
 
     if resp.status_code != 200:
-        # Surface raw API error for easy debugging in Render logs
         raise HTTPException(status_code=502, detail=f"Image API error [{resp.status_code}]: {resp.text}")
 
-    data = resp.json()
-    if not data.get("data"):
-        raise HTTPException(status_code=502, detail=f"Image API returned no data: {data}")
-    return data["data"][0]["b64_json"]
+    js = resp.json()
+    if not js.get("data"):
+        raise HTTPException(status_code=502, detail=f"Image API returned no data: {js}")
+    return js["data"][0]["b64_json"]
 
 
 # =========================
