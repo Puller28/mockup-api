@@ -1,10 +1,11 @@
-# app.py — Outpainted Wall-Art Mockups (REST version, Render-friendly)
-# Upload art -> we protect the art with a mask -> OpenAI Images/edits outpaints a room+frame around it.
+# app.py — Outpainted Wall-Art Mockups (REST, ratio+mat support)
+# Upload art -> protect art with mask -> OpenAI Images/edits paints room+frame around it.
 
 import io
 import os
 import base64
 import requests
+from math import ceil
 from typing import Dict, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -49,7 +50,7 @@ STYLE_PROMPTS: Dict[str, str] = {
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.1")
+app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.2")
 
 # Open CORS for easy testing; tighten in prod.
 app.add_middleware(
@@ -79,9 +80,39 @@ def _img_to_png_bytes(img: Image.Image) -> bytes:
 def _resize_fit(img: Image.Image, target: Tuple[int, int]) -> Image.Image:
     return ImageOps.contain(img, target, Image.LANCZOS)
 
+def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0)):
+    """
+    Pads image (no crop) to the given aspect ratio by adding transparent borders.
+    Returns (padded_img, placed_bbox) where placed_bbox=(x0,y0,x1,y1) of original on new canvas.
+    """
+    img = img.convert("RGBA")
+    w, h = img.size
+    target_ratio = ratio_w / ratio_h
+    src_ratio = w / h
+
+    if abs(src_ratio - target_ratio) < 1e-6:
+        canvas = Image.new("RGBA", (w, h), bg)
+        canvas.paste(img, (0, 0), img)
+        return canvas, (0, 0, w, h)
+
+    if src_ratio > target_ratio:
+        # wider than target: extend height
+        canvas_w = w
+        canvas_h = ceil(w / target_ratio)
+    else:
+        # taller than target: extend width
+        canvas_h = h
+        canvas_w = ceil(h * target_ratio)
+
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), bg)
+    x0 = (canvas_w - w) // 2
+    y0 = (canvas_h - h) // 2
+    canvas.paste(img, (x0, y0), img)
+    return canvas, (x0, y0, x0 + w, y0 + h)
+
 def _pad_canvas_keep_center(img: Image.Image,
                             pad_ratio: float,
-                            target_side: int) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
+                            target_side: int):
     """
     Optionally upscales the art to target_side (longest edge),
     then adds border space around it (pad_ratio of max side).
@@ -107,22 +138,30 @@ def _pad_canvas_keep_center(img: Image.Image,
 def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int, int, int]) -> Image.Image:
     """
     Mask for Images Edits API:
-      - Transparent pixels = KEEP (the original artwork)
-      - Opaque pixels      = PAINT (room + frame around)
+      - Transparent = KEEP (the original artwork)
+      - Opaque      = PAINT (room + frame around)
     """
     W, H = canvas_size
-    mask = Image.new("RGBA", (W, H), (0, 0, 0, 255))  # paint everywhere
+    mask = Image.new("RGBA", (W, H), (0, 0, 0, 255))
     x0, y0, x1, y1 = keep_bbox
     hole = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
     mask.paste(hole, (x0, y0))
     return mask
 
+def _pick_api_size(w: int, h: int) -> str:
+    """
+    Map canvas orientation to allowed Images-Edits sizes.
+    Allowed: '1024x1024', '1024x1536' (portrait), '1536x1024' (landscape).
+    """
+    if w == h:
+        return "1024x1024"
+    return "1024x1536" if h > w else "1536x1024"
 
 # ---- OpenAI Images/edits via REST (version-proof) ----
 def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str) -> str:
     """
-    Calls https://api.openai.com/v1/images/edits with multipart form.
-    Text fields go in `data`, binary images go in `files`.
+    Calls https://api.openai.com/v1/images/edits (multipart).
+    Text fields go in `data`, binaries in `files`. Returns first image's base64.
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -131,15 +170,12 @@ def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: s
     url = "https://api.openai.com/v1/images/edits"
     headers = {"Authorization": f"Bearer {api_key}"}
 
-    # Text fields must be in `data`
     data = {
         "model": "gpt-image-1",
         "prompt": prompt,
-        "size": size,          # e.g., "2048x2048"
-        # "n": "1",            # optional
+        "size": size,   # '1024x1024' | '1024x1536' | '1536x1024'
+        # "n": "1",
     }
-
-    # Binary parts go in `files`
     files = {
         "image": ("canvas.png", image_bytes, "image/png"),
         "mask":  ("mask.png",   mask_bytes,  "image/png"),
@@ -169,11 +205,16 @@ async def outpaint_mockup(
     style_key: str = Form("modern_living_black_frame_spotlit"),
     target_px: int = Form(DEFAULT_TARGET_PX),
     pad_ratio: float = Form(0.42),
-    make_print_previews: int = Form(1)  # 1=yes, 0=no
+    make_print_previews: int = Form(1),      # 1=yes, 0=no
+    normalize_ratio: str = Form(""),         # e.g. "4:5", "3:4", "2:3" ("" = keep original aspect)
+    mat_pct: float = Form(0.0),              # e.g., 0.03 for 3% inner margin
 ):
     """
-    Upload a piece of art; the API paints a realistic room + thin frame around it.
-    Returns a master PNG (base64) and optional print-size previews.
+    Upload a piece of art; API paints a realistic room + thin frame around it.
+    Options:
+      - normalize_ratio: force art to a given print ratio (pads only, no crop)
+      - mat_pct: inner margin inside the frame (0–0.1 typical)
+    Returns master PNG (base64) and optional print-size previews.
     """
     if style_key not in STYLE_PROMPTS:
         raise HTTPException(400, f"Unknown style_key. Choose one of: {list(STYLE_PROMPTS)}")
@@ -184,20 +225,35 @@ async def outpaint_mockup(
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
-    # 2) Build padded canvas and KEEP mask
+    # 1a) (optional) normalize to a requested print ratio (pad only)
+    if normalize_ratio:
+        try:
+            rw, rh = [int(x) for x in normalize_ratio.split(":")]
+            art, _ = _pad_to_ratio(art, rw, rh)
+        except Exception:
+            raise HTTPException(400, f"Invalid normalize_ratio '{normalize_ratio}'. Use like '4:5', '3:4', '2:3'.")
+
+    # 1b) (optional) inner mat (shrink visible art a bit to avoid frame touch)
+    if mat_pct and mat_pct > 0:
+        w, h = art.size
+        mx = int(w * mat_pct / 2.0)
+        my = int(h * mat_pct / 2.0)
+        mat_canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        mat_canvas.paste(art, (mx, my), art)
+        art = mat_canvas
+
+    # 2) Build padded canvas for outpainting (room around the art)
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
 
-    canvas_bytes = _img_to_png_bytes(canvas)
-    mask_bytes = _img_to_png_bytes(mask)
-
     # 3) Call OpenAI Images/edits (REST)
+    api_size = _pick_api_size(canvas.width, canvas.height)  # or "auto"
     prompt = STYLE_PROMPTS[style_key]
     b64 = images_edit_rest(
-        image_bytes=canvas_bytes,
-        mask_bytes=mask_bytes,
+        image_bytes=_img_to_png_bytes(canvas),
+        mask_bytes=_img_to_png_bytes(mask),
         prompt=prompt,
-        size=f"{canvas.width}x{canvas.height}",
+        size=api_size,
     )
 
     # 4) Decode master + generate optional previews
@@ -219,7 +275,10 @@ async def outpaint_mockup(
     return JSONResponse({
         "style": style_key,
         "canvas_size": [canvas.width, canvas.height],
-        "art_bbox": keep_bbox,  # (x0, y0, x1, y1) where the original art was preserved
+        "art_bbox": keep_bbox,        # (x0, y0, x1, y1) where original art was preserved
+        "normalize_ratio": normalize_ratio,
+        "mat_pct": mat_pct,
+        "api_size": api_size,
         "image_b64": master_b64,
         "previews": previews
     })
