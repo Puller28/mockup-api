@@ -1,0 +1,23 @@
+{
+  "key": "lr01",
+  "background": "background.png",
+  "overlay": "overlay.png",
+  "inner_quad": [
+    [
+      156,
+      196
+    ],
+    [
+      1875,
+      196
+    ],
+    [
+      1875,
+      1465
+    ],
+    [
+      156,
+      1465
+    ]
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "key": "drk01",
+  "name": "Dark Frame Mockup",
+  "background": "background.png",
+  "overlay": "overlay.png",
+  "inner_quad": [
+    [2706, 659],
+    [3873, 659],
+    [3873, 2469],
+    [2706, 2469]
+  ]
+}
