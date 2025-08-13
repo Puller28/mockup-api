@@ -1,5 +1,6 @@
-# app.py — Outpainted Wall-Art Mockups (REST, ratio+mat, PNG/ZIP, size=auto)
+# app.py — Outpainted Wall-Art Mockups (REST, multi-variant, ratio+mat, PNG/ZIP, size=auto)
 # Upload art -> protect art with mask -> OpenAI Images/edits paints room+frame around it.
+# Now supports generating multiple scene variants in one call.
 
 import io
 import os
@@ -7,7 +8,7 @@ import base64
 import requests
 import zipfile
 from math import ceil
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -28,30 +29,43 @@ PRINT_SIZES: Dict[str, Tuple[int, int]] = {
     "A4":    (1654, 2339),
 }
 
+# Style keys map to prompts.
 STYLE_PROMPTS: Dict[str, str] = {
-    "modern_living_black_frame_spotlit": (
+    "living_room": (
         "Create a realistic interior mockup AROUND the existing artwork. "
         "Keep the artwork exactly as-is. Paint a modern living room scene: "
         "matte neutral wall with subtle texture, focused ceiling spotlight, "
-        "thin black metal frame around the artwork with correct perspective and natural shadows. "
+        "a thin black metal frame with correct perspective and natural shadows. "
         "Minimalist, photorealistic, no text or logos."
     ),
-    "gallery_white": (
-        "Create a clean gallery wall around the existing artwork. White wall with subtle texture, "
-        "museum lighting from above, thin black frame, soft shadows, no text."
+    "bedroom": (
+        "Around the existing artwork, paint a cozy bedroom scene: warm neutral wall, soft daylight, "
+        "light wood frame around the artwork, gentle shadows, photorealistic, no text or logos."
     ),
-    "bedroom_soft_wood": (
-        "Around the existing artwork, paint a cozy bedroom: warm neutral wall, soft daylight, "
-        "light wood frame, gentle shadows. Keep the artwork unchanged, no text."
+    "study": (
+        "Around the existing artwork, paint a refined study/home office: desaturated wall paint, "
+        "subtle bookshelf blur and desk hints, muted daylight from the left, "
+        "thin dark metal frame, soft realistic shadows. No text or logos."
+    ),
+    "gallery": (
+        "Paint a clean gallery wall around the existing artwork: white wall with subtle microtexture, "
+        "museum track lighting from above, thin black metal frame, natural falloff shadows. No text."
+    ),
+    "kitchen": (
+        "Around the existing artwork, paint a tasteful kitchen nook: light painted wall, "
+        "subtle tile or counter hints, soft daylight, thin black frame, realistic shadows. No text."
     ),
 }
+
+# Default multi-variant set
+DEFAULT_STYLE_LIST = ["living_room", "bedroom", "study", "gallery", "kitchen"]
 
 
 # =========================
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.3")
+app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.4")
 
 # Open CORS for easy testing; tighten in prod.
 app.add_middleware(
@@ -64,7 +78,8 @@ app.add_middleware(
 def healthz():
     return {
         "ok": True,
-        "styles": list(STYLE_PROMPTS.keys()),
+        "styles_available": list(STYLE_PROMPTS.keys()),
+        "default_styles": DEFAULT_STYLE_LIST,
         "target_default": DEFAULT_TARGET_PX,
     }
 
@@ -145,15 +160,12 @@ def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int
     W, H = canvas_size
     x0, y0, x1, y1 = keep_bbox
 
-    # Start fully transparent so the model can PAINT the room everywhere...
+    # Allow painting everywhere...
     mask = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-
-    # ...then paste an OPAQUE block where the artwork is, so it is KEPT.
+    # ...except over the artwork (keep opaque).
     keep_block = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 255))
     mask.paste(keep_block, (x0, y0))
-
     return mask
-
 
 # ---- OpenAI Images/edits via REST (version-proof) ----
 def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str = "auto") -> str:
@@ -177,7 +189,6 @@ def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: s
         "model": "gpt-image-1",
         "prompt": prompt,
         "size": size,   # 'auto' | '1024x1024' | '1024x1536' | '1536x1024'
-        # "n": "1",
     }
     files = {
         "image": ("canvas.png", image_bytes, "image/png"),
@@ -199,30 +210,38 @@ def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: s
 
 
 # =========================
-# Route: outpaint mockup
+# Route: outpaint mockup (multi-variant)
 # =========================
 
 @app.post("/outpaint/mockup")
 async def outpaint_mockup(
     file: UploadFile = File(...),
-    style_key: str = Form("modern_living_black_frame_spotlit"),
+    # one or many styles: comma-separated keys from STYLE_PROMPTS
+    styles: str = Form(",".join(DEFAULT_STYLE_LIST)),
     target_px: int = Form(DEFAULT_TARGET_PX),
     pad_ratio: float = Form(0.42),
     make_print_previews: int = Form(1),      # 1=yes, 0=no
     normalize_ratio: str = Form(""),         # e.g. "4:5", "3:4", "2:3" ("" = keep original aspect)
     mat_pct: float = Form(0.0),              # e.g., 0.03 for 3% inner margin
     return_format: str = Form("json"),       # "json" | "png" | "zip"
-    filename: str = Form("mockup"),          # base filename for png/zip
+    filename: str = Form("mockup_bundle"),   # base filename for png/zip
 ):
     """
     Upload a piece of art; API paints a realistic room + thin frame around it.
-    Options:
-      - normalize_ratio: force art to a given print ratio (pads only, no crop)
-      - mat_pct: inner margin inside the frame (0–0.1 typical)
-      - return_format: "json" (default), "png" (direct download), or "zip" (master + previews)
+    - styles: comma-separated (e.g., "living_room,bedroom,study,gallery,kitchen")
+    - normalize_ratio: force art to a given print ratio (pads only; no crop)
+    - mat_pct: inner margin inside frame (0–0.1 typical)
+    - return_format: "json" (default), "png" (first style only), or "zip" (all styles)
+    Returns either JSON with all images, a single PNG, or a ZIP containing everything.
     """
-    if style_key not in STYLE_PROMPTS:
-        raise HTTPException(400, f"Unknown style_key. Choose one of: {list(STYLE_PROMPTS)}")
+
+    # Parse + validate styles
+    style_list = [s.strip() for s in styles.split(",") if s.strip()]
+    invalid = [s for s in style_list if s not in STYLE_PROMPTS]
+    if invalid:
+        raise HTTPException(400, f"Unknown styles {invalid}. Choose from {list(STYLE_PROMPTS.keys())}")
+    if not style_list:
+        raise HTTPException(400, "No valid styles provided.")
 
     # 1) Read art
     try:
@@ -247,61 +266,68 @@ async def outpaint_mockup(
         mat_canvas.paste(art, (mx, my), art)
         art = mat_canvas
 
-    # 2) Build padded canvas for outpainting (room around the art)
+    # --- Build shared canvas + mask once (saves time); reuse for each style ---
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
+    canvas_bytes = _img_to_png_bytes(canvas)
+    mask_bytes = _img_to_png_bytes(mask)
 
-    # 3) Call OpenAI Images/edits (REST) — default size='auto'
-    prompt = STYLE_PROMPTS[style_key]
-    b64 = images_edit_rest(
-        image_bytes=_img_to_png_bytes(canvas),
-        mask_bytes=_img_to_png_bytes(mask),
-        prompt=prompt,
-        size="auto",  # robust for any aspect ratio
-    )
+    # 2) Generate each style
+    results: List[Dict[str, str]] = []
+    for style_key in style_list:
+        prompt = STYLE_PROMPTS[style_key]
+        b64 = images_edit_rest(
+            image_bytes=canvas_bytes,
+            mask_bytes=mask_bytes,
+            prompt=prompt,
+            size="auto",  # robust for any aspect ratio
+        )
+        results.append({"style": style_key, "image_b64": b64})
 
-    # 4) Decode master + generate optional previews
-    master = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
-
-    previews: Dict[str, str] = {}
+    # 3) Optional previews per result
+    previews_map: Dict[str, Dict[str, str]] = {}
     if make_print_previews:
-        for name, wh in PRINT_SIZES.items():
-            img = _resize_fit(master, wh)
-            buf = io.BytesIO()
-            img.save(buf, "PNG")
-            previews[name] = base64.b64encode(buf.getvalue()).decode("utf-8")
+        for item in results:
+            key = item["style"]
+            img = Image.open(io.BytesIO(base64.b64decode(item["image_b64"]))).convert("RGBA")
+            previews: Dict[str, str] = {}
+            for name, wh in PRINT_SIZES.items():
+                thumb = _resize_fit(img, wh)
+                buf = io.BytesIO()
+                thumb.save(buf, "PNG")
+                previews[name] = base64.b64encode(buf.getvalue()).decode("utf-8")
+            previews_map[key] = previews
 
-    # 5) Respond (json/png/zip)
-    buf_master = io.BytesIO()
-    master.save(buf_master, "PNG")
-    png_bytes = buf_master.getvalue()
-
-    # A) direct PNG stream
+    # 4) Return (json / png / zip)
     if return_format.lower() == "png":
-        headers = {"Content-Disposition": f'inline; filename="{filename}.png"'}
-        return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png", headers=headers)
+        # return first style as direct PNG
+        first = results[0]
+        img_bytes = base64.b64decode(first["image_b64"])
+        headers = {"Content-Disposition": f'inline; filename="{filename}_{first["style"]}.png"'}
+        return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png", headers=headers)
 
-    # B) ZIP bundle: master + optional previews
     if return_format.lower() == "zip":
         mem = io.BytesIO()
         with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(f"{filename}.png", png_bytes)
-            if make_print_previews and previews:
-                for name, b64s in previews.items():
-                    zf.writestr(f"{filename}_preview_{name}.png", base64.b64decode(b64s))
+            for item in results:
+                key = item["style"]
+                zf.writestr(f"{filename}_{key}.png", base64.b64decode(item["image_b64"]))
+                if make_print_previews and key in previews_map:
+                    for pname, pb64 in previews_map[key].items():
+                        zf.writestr(f"{filename}_{key}_preview_{pname}.png", base64.b64decode(pb64))
         mem.seek(0)
         headers = {"Content-Disposition": f'attachment; filename="{filename}.zip"'}
         return StreamingResponse(mem, media_type="application/zip", headers=headers)
 
-    # C) default JSON
-    master_b64 = base64.b64encode(png_bytes).decode("utf-8")
-    return JSONResponse({
-        "style": style_key,
+    # default JSON
+    payload = {
+        "styles_requested": style_list,
         "canvas_size": [canvas.width, canvas.height],
-        "art_bbox": keep_bbox,        # (x0, y0, x1, y1) where original art was preserved
+        "art_bbox": keep_bbox,
         "normalize_ratio": normalize_ratio,
         "mat_pct": mat_pct,
         "api_size": "auto",
-        "image_b64": master_b64,
-        "previews": previews
-    })
+        "results": results,           # [{style, image_b64}]
+        "previews": previews_map,     # {style: {size_name: b64, ...}}
+    }
+    return JSONResponse(payload)
