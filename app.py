@@ -103,6 +103,56 @@ def _strip_data_url(b64_or_data_url: str) -> str:
             return b64_or_data_url
     return b64_or_data_url
 
+# ---------- Debug helpers for mask visualization ----------
+
+def _png_bytes(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def _img_to_data_url(img: Image.Image) -> str:
+    return "data:image/png;base64," + base64.b64encode(_png_bytes(img)).decode("utf-8")
+
+def _to_rgba(im: Image.Image) -> Image.Image:
+    return im.convert("RGBA")
+
+def _make_checkerboard(w: int, h: int, tile: int = 16) -> Image.Image:
+    bg = Image.new("RGB", (w, h), (200, 200, 200))
+    px = bg.load()
+    for y in range(h):
+        for x in range(w):
+            if ((x // tile) + (y // tile)) % 2 == 0:
+                px[x, y] = (220, 220, 220)
+            else:
+                px[x, y] = (180, 180, 180)
+    return bg
+
+def _apply_mask_cutout(src_rgba: Image.Image, mask_rgba: Image.Image, invert: bool = False) -> tuple[Image.Image, Image.Image]:
+    """
+    Returns (subject_cutout_rgba, background_only_rgba)
+    - subject_cutout: transparent where mask is opaque (background), original where mask is transparent (subject kept)
+    - background_only: original where mask is opaque (background), transparent where mask is transparent (subject)
+    """
+    w, h = src_rgba.size
+    # ensure mask alpha channel
+    if "A" in mask_rgba.getbands():
+        alpha = mask_rgba.getchannel("A")
+    else:
+        alpha = mask_rgba.convert("L")  # fallback luminance
+
+    if invert:
+        alpha = Image.eval(alpha, lambda a: 255 - a)
+
+    # background_only: keep where alpha>0
+    bg_only = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    bg_only = Image.composite(src_rgba, bg_only, alpha)
+
+    # subject_cutout: keep inverse of alpha
+    inv_alpha = Image.eval(alpha, lambda a: 255 - a)
+    subj = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    subj = Image.composite(src_rgba, subj, inv_alpha)
+
+    return subj, bg_only
 
 
 # ------------- HTTP helpers ---------------
@@ -420,6 +470,96 @@ def _generate_variations(img: Image.Image, style: str, mode: str, n: int = 5) ->
         if imgs:
             results.append({"seed": s, "image_b64": imgs[0]})
     return results
+
+from fastapi.responses import Response
+
+# keep last artifacts around for quick download
+_last_mask_png: bytes | None = None
+_last_cutout_png: bytes | None = None
+
+@app.post("/debug/mask", response_class=HTMLResponse)
+async def debug_mask(
+    file: UploadFile = File(...),
+    mode: str = Form("preview"),
+    invert: int = Form(0)
+):
+    """
+    Show the raw mask from the mask worker and how it applies to the image.
+    - mode: preview|final (forwarded to mask worker)
+    - invert: 0 or 1 (visually flip mask to test inversion issues)
+    """
+    _assert_env()
+
+    # 1) load original image
+    src = Image.open(io.BytesIO(await file.read())).convert("RGBA")
+    w, h = src.size
+
+    # 2) get mask from mask-worker
+    mask_b64 = call_mask_worker(b64_png(src), mode=mode)
+    # decode to image (should be RGBA with alpha)
+    mask_bytes = base64.b64decode(mask_b64)
+    mask = Image.open(io.BytesIO(mask_bytes)).convert("RGBA")
+
+    # 3) optional invert for debugging
+    inv = bool(invert)
+    cutout, bg_only = _apply_mask_cutout(src, mask, invert=inv)
+
+    # 4) show mask itself on checkerboard to see alpha properly
+    checker = _make_checkerboard(w, h)
+    checker_rgba = checker.convert("RGBA")
+    # mask’s alpha used to composite a white layer for visibility
+    white = Image.new("RGBA", (w, h), (255, 255, 255, 255))
+    mask_over_checker = Image.composite(white, checker_rgba, mask.getchannel("A"))
+
+    # 5) keep last outputs for easy download
+    global _last_mask_png, _last_cutout_png
+    _last_mask_png   = _png_bytes(mask)
+    _last_cutout_png = _png_bytes(cutout)
+
+    # 6) build HTML
+    html = f"""
+    <h1>Mask Debug</h1>
+    <p><b>mode:</b> {mode} &nbsp;&nbsp; <b>invert:</b> {inv}</p>
+    <div style="display:flex;gap:16px;flex-wrap:wrap">
+      <figure style="margin:0">
+        <figcaption>Original</figcaption>
+        <img style="max-width:380px" src="{_img_to_data_url(src)}"/>
+      </figure>
+      <figure style="margin:0">
+        <figcaption>Raw Mask (PNG)</figcaption>
+        <img style="max-width:380px" src="{_img_to_data_url(mask)}"/>
+      </figure>
+      <figure style="margin:0">
+        <figcaption>Mask on Checkerboard (alpha)</figcaption>
+        <img style="max-width:380px" src="{_img_to_data_url(mask_over_checker)}"/>
+      </figure>
+      <figure style="margin:0">
+        <figcaption>Subject Cutout (kept area)</figcaption>
+        <img style="max-width:380px" src="{_img_to_data_url(cutout)}"/>
+      </figure>
+      <figure style="margin:0">
+        <figcaption>Background-Only (to be inpainted)</figcaption>
+        <img style="max-width:380px" src="{_img_to_data_url(bg_only)}"/>
+      </figure>
+    </div>
+    <p>
+      <a href="/debug/last-mask.png" target="_blank">Download last mask</a> |
+      <a href="/debug/last-cutout.png" target="_blank">Download last cutout</a>
+    </p>
+    """
+    return HTMLResponse(content=html)
+
+@app.get("/debug/last-mask.png")
+def get_last_mask():
+    if _last_mask_png is None:
+        return Response(status_code=404)
+    return Response(content=_last_mask_png, media_type="image/png")
+
+@app.get("/debug/last-cutout.png")
+def get_last_cutout():
+    if _last_cutout_png is None:
+        return Response(status_code=404)
+    return Response(content=_last_cutout_png, media_type="image/png")
 
 
 # 1x1 transparent PNG
