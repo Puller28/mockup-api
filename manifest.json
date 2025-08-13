@@ -1,0 +1,11 @@
+{
+  "key": "lr01",
+  "background": "background.png",
+  "overlay": "overlay.png",
+  "inner_quad": [
+    [640, 220],   // top-left (x, y) in BACKGROUND pixel coords
+    [1480, 210],  // top-right
+    [1492, 1028], // bottom-right
+    [638, 1040]   // bottom-left
+  ]
+}
