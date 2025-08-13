@@ -1,15 +1,16 @@
-# app.py — Outpainted Wall-Art Mockups (REST, ratio+mat support)
+# app.py — Outpainted Wall-Art Mockups (REST, ratio+mat, PNG/ZIP, size=auto)
 # Upload art -> protect art with mask -> OpenAI Images/edits paints room+frame around it.
 
 import io
 import os
 import base64
 import requests
+import zipfile
 from math import ceil
 from typing import Dict, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 
@@ -50,7 +51,7 @@ STYLE_PROMPTS: Dict[str, str] = {
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.2")
+app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.3")
 
 # Open CORS for easy testing; tighten in prod.
 app.add_middleware(
@@ -148,20 +149,12 @@ def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int
     mask.paste(hole, (x0, y0))
     return mask
 
-def _pick_api_size(w: int, h: int) -> str:
-    """
-    Map canvas orientation to allowed Images-Edits sizes.
-    Allowed: '1024x1024', '1024x1536' (portrait), '1536x1024' (landscape).
-    """
-    if w == h:
-        return "1024x1024"
-    return "1024x1536" if h > w else "1536x1024"
-
 # ---- OpenAI Images/edits via REST (version-proof) ----
-def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str) -> str:
+def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str = "auto") -> str:
     """
     Calls https://api.openai.com/v1/images/edits (multipart).
     Text fields go in `data`, binaries in `files`. Returns first image's base64.
+    Uses size='auto' by default so any aspect ratio works.
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -170,10 +163,14 @@ def images_edit_rest(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: s
     url = "https://api.openai.com/v1/images/edits"
     headers = {"Authorization": f"Bearer {api_key}"}
 
+    org_id = os.getenv("OPENAI_ORG_ID")
+    if org_id:
+        headers["OpenAI-Organization"] = org_id
+
     data = {
         "model": "gpt-image-1",
         "prompt": prompt,
-        "size": size,   # '1024x1024' | '1024x1536' | '1536x1024'
+        "size": size,   # 'auto' | '1024x1024' | '1024x1536' | '1536x1024'
         # "n": "1",
     }
     files = {
@@ -208,13 +205,15 @@ async def outpaint_mockup(
     make_print_previews: int = Form(1),      # 1=yes, 0=no
     normalize_ratio: str = Form(""),         # e.g. "4:5", "3:4", "2:3" ("" = keep original aspect)
     mat_pct: float = Form(0.0),              # e.g., 0.03 for 3% inner margin
+    return_format: str = Form("json"),       # "json" | "png" | "zip"
+    filename: str = Form("mockup"),          # base filename for png/zip
 ):
     """
     Upload a piece of art; API paints a realistic room + thin frame around it.
     Options:
       - normalize_ratio: force art to a given print ratio (pads only, no crop)
       - mat_pct: inner margin inside the frame (0–0.1 typical)
-    Returns master PNG (base64) and optional print-size previews.
+      - return_format: "json" (default), "png" (direct download), or "zip" (master + previews)
     """
     if style_key not in STYLE_PROMPTS:
         raise HTTPException(400, f"Unknown style_key. Choose one of: {list(STYLE_PROMPTS)}")
@@ -246,14 +245,13 @@ async def outpaint_mockup(
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
 
-    # 3) Call OpenAI Images/edits (REST)
-    api_size = _pick_api_size(canvas.width, canvas.height)  # or "auto"
+    # 3) Call OpenAI Images/edits (REST) — default size='auto'
     prompt = STYLE_PROMPTS[style_key]
     b64 = images_edit_rest(
         image_bytes=_img_to_png_bytes(canvas),
         mask_bytes=_img_to_png_bytes(mask),
         prompt=prompt,
-        size=api_size,
+        size="auto",  # robust for any aspect ratio
     )
 
     # 4) Decode master + generate optional previews
@@ -267,18 +265,37 @@ async def outpaint_mockup(
             img.save(buf, "PNG")
             previews[name] = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    # 5) Respond
+    # 5) Respond (json/png/zip)
     buf_master = io.BytesIO()
     master.save(buf_master, "PNG")
-    master_b64 = base64.b64encode(buf_master.getvalue()).decode("utf-8")
+    png_bytes = buf_master.getvalue()
 
+    # A) direct PNG stream
+    if return_format.lower() == "png":
+        headers = {"Content-Disposition": f'inline; filename="{filename}.png"'}
+        return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png", headers=headers)
+
+    # B) ZIP bundle: master + optional previews
+    if return_format.lower() == "zip":
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"{filename}.png", png_bytes)
+            if make_print_previews and previews:
+                for name, b64s in previews.items():
+                    zf.writestr(f"{filename}_preview_{name}.png", base64.b64decode(b64s))
+        mem.seek(0)
+        headers = {"Content-Disposition": f'attachment; filename="{filename}.zip"'}
+        return StreamingResponse(mem, media_type="application/zip", headers=headers)
+
+    # C) default JSON
+    master_b64 = base64.b64encode(png_bytes).decode("utf-8")
     return JSONResponse({
         "style": style_key,
         "canvas_size": [canvas.width, canvas.height],
         "art_bbox": keep_bbox,        # (x0, y0, x1, y1) where original art was preserved
         "normalize_ratio": normalize_ratio,
         "mat_pct": mat_pct,
-        "api_size": api_size,
+        "api_size": "auto",
         "image_b64": master_b64,
         "previews": previews
     })
