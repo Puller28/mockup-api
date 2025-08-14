@@ -169,18 +169,37 @@ def _pad_canvas_keep_center(img: Image.Image, pad_ratio: float, target_side: int
     canvas.paste(img, (x0, y0), img)
     return canvas, (x0, y0, x0 + w, y0 + h)
 
-def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int, int, int]) -> Image.Image:
+def _build_outpaint_mask(
+    canvas_size: Tuple[int, int],
+    keep_bbox: Tuple[int, int, int, int],
+    lock_pad_px: int = 2,   # expand the KEEP box a tiny bit to avoid edge bleed
+) -> Image.Image:
     """
-    For OpenAI Images Edits:
-      - Transparent = PAINT (model edits here) -> the border around the art
-      - Opaque      = KEEP  (preserve content) -> the original artwork region
+    OpenAI Images/edits expects:
+      - transparent (alpha=0) = PAINT HERE
+      - opaque     (alpha=255) = KEEP AS-IS
+    We make a crisp, binary-alpha mask with no antialiasing, and expand the
+    keep box slightly so the frame edge never leaks into 'paint' area.
     """
     W, H = canvas_size
     x0, y0, x1, y1 = keep_bbox
+
+    # Expand KEEP box a touch to avoid any transparent sliver at the edge
+    x0 = max(0, x0 - lock_pad_px)
+    y0 = max(0, y0 - lock_pad_px)
+    x1 = min(W, x1 + lock_pad_px)
+    y1 = min(H, y1 + lock_pad_px)
+
+    # Build alpha channel: 0 everywhere (paint), 255 inside keep rect
+    alpha = Image.new("L", (W, H), 0)                # 0 = PAINT
+    keep_alpha = Image.new("L", (x1 - x0, y1 - y0), 255)  # 255 = KEEP
+    alpha.paste(keep_alpha, (x0, y0))
+
+    # Final RGBA mask with binary alpha only
     mask = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    keep_block = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 255))
-    mask.paste(keep_block, (x0, y0))
+    mask.putalpha(alpha)
     return mask
+
 
 def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str = "auto") -> str:
     """Call OpenAI Images/edits with multipart. Returns first image's base64."""
