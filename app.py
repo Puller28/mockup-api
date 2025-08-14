@@ -1,9 +1,11 @@
-# app.py — Outpainted Wall-Art Mockups (full-size ingest, preserve-art)
-# - NO pre-resize: uploads are used at full resolution (EXIF fixed, no scaling)
+# app.py — Outpainted Wall-Art Mockups (full-size ingest, preserve-art, variants)
+# - NO pre-resize (you handle size upstream)
 # - Correct mask: alpha=255 KEEP (art), alpha=0 PAINT (around) + small keep expansion
 # - Strong preserve directive in every prompt
-# - Endpoints: /outpaint/mockup_single and /outpaint/mockup
-# - Uses OpenAI Images/edits (gpt-image-1, size="auto")
+# - Endpoints:
+#     /outpaint/mockup_single  → one style
+#     /outpaint/mockup         → multi-style as before; if ONE style, generate N variants (default 5)
+# - Uses OpenAI Images/edits (gpt-image-1, size="auto", supports n=1..10)
 
 import io
 import os
@@ -25,8 +27,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly corrupted files
 # Config / Presets
 # =========================
 
-# No upload clamping; you control size upstream.
-DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))  # canvas long side (only used to scale UP if smaller)
+DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))  # canvas long side (only upscales if smaller)
 
 PRINT_SIZES: Dict[str, Tuple[int, int]] = {
     "4x5":   (1600, 2000),
@@ -72,7 +73,7 @@ PRESERVE_DIRECTIVE = (
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Wall-Art Mockups (REST, full-size ingest)", version="3.0")
+app = FastAPI(title="Outpainted Wall-Art Mockups (REST, full-size + variants)", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,7 +88,7 @@ def healthz():
         "styles_available": list(STYLE_PROMPTS.keys()),
         "default_styles": DEFAULT_STYLE_LIST,
         "target_default": DEFAULT_TARGET_PX,
-        "note": "Uploads are used full-size (no server-side downscale).",
+        "note": "Uploads are used full-size (no server-side downscale). If one style is passed to /outpaint/mockup, it can generate N variants.",
     }
 
 
@@ -104,10 +105,7 @@ def _resize_fit(img: Image.Image, target: Tuple[int, int]) -> Image.Image:
     return ImageOps.contain(img, target, Image.LANCZOS)
 
 def _ingest_user_image_fullsize(file_bytes: bytes) -> Image.Image:
-    """
-    Load the uploaded image at original resolution.
-    Apply EXIF orientation, convert to RGBA. NO resizing.
-    """
+    """Load original resolution; EXIF transpose; RGBA. No resizing."""
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img)
     if img.mode != "RGBA":
@@ -174,7 +172,6 @@ def _build_outpaint_mask(
     W, H = canvas_size
     x0, y0, x1, y1 = keep_bbox
 
-    # Slight expansion prevents edge pixels from being repainted
     x0 = max(0, x0 - lock_pad_px)
     y0 = max(0, y0 - lock_pad_px)
     x1 = min(W, x1 + lock_pad_px)
@@ -188,8 +185,14 @@ def _build_outpaint_mask(
     mask.putalpha(alpha)
     return mask
 
-def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str = "auto") -> str:
-    """Call OpenAI Images/edits (multipart). Returns first image's base64."""
+def _openai_images_edit_multi(
+    image_bytes: bytes,
+    mask_bytes: bytes,
+    prompt: str,
+    n: int = 1,
+    size: str = "auto",
+) -> List[str]:
+    """Call OpenAI Images/edits (multipart) and return a list of base64 images (length n)."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set on server")
@@ -200,7 +203,8 @@ def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size
     if org_id:
         headers["OpenAI-Organization"] = org_id
 
-    data = {"model": "gpt-image-1", "prompt": prompt, "size": size}
+    # n is respected by gpt-image-1 across /edits (1..10)
+    data = {"model": "gpt-image-1", "prompt": prompt, "size": size, "n": str(max(1, min(int(n), 10)))}
     files = {
         "image": ("canvas.png", image_bytes, "image/png"),
         "mask":  ("mask.png",   mask_bytes,  "image/png"),
@@ -215,13 +219,14 @@ def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size
         raise HTTPException(status_code=502, detail=f"Image API error [{resp.status_code}]: {resp.text}")
 
     js = resp.json()
-    if not js.get("data"):
+    items = js.get("data") or []
+    if not items:
         raise HTTPException(status_code=502, detail=f"Image API returned no data: {js}")
-    return js["data"][0]["b64_json"]
+    return [it.get("b64_json") for it in items if it.get("b64_json")]
 
 
 # =========================================================
-# Low-RAM Endpoint: one style only (still safest)
+# Single-style endpoint (unchanged behavior)
 # =========================================================
 @app.post("/outpaint/mockup_single")
 async def outpaint_mockup_single(
@@ -237,13 +242,12 @@ async def outpaint_mockup_single(
     if style not in STYLE_PROMPTS:
         raise HTTPException(400, f"Unknown style '{style}'. Choose from {list(STYLE_PROMPTS.keys())}")
 
-    # FULL-SIZE ingest (no downscale)
+    # FULL-SIZE ingest
     try:
         art = _ingest_user_image_fullsize(await file.read())
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
-    # Optional ratio pad (no crop)
     if normalize_ratio:
         try:
             rw, rh = [int(x) for x in normalize_ratio.split(":")]
@@ -251,7 +255,6 @@ async def outpaint_mockup_single(
         except Exception:
             raise HTTPException(400, f"Invalid normalize_ratio '{normalize_ratio}'. Use '4:5', '3:4', '2:3'.")
 
-    # Optional mat
     if mat_pct and mat_pct > 0:
         w, h = art.size
         mx = int(w * mat_pct / 2.0)
@@ -260,13 +263,13 @@ async def outpaint_mockup_single(
         mat_canvas.paste(art, (mx, my), art)
         art = mat_canvas
 
-    # Canvas + mask
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
 
     prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
-    b64 = _openai_images_edit(_img_to_png_bytes(canvas), _img_to_png_bytes(mask),
-                              prompt=prompt, size="auto")
+    b64_list = _openai_images_edit_multi(_img_to_png_bytes(canvas), _img_to_png_bytes(mask),
+                                         prompt=prompt, n=1, size="auto")
+    b64 = b64_list[0]
 
     if return_format.lower() == "json":
         return JSONResponse({
@@ -285,9 +288,9 @@ async def outpaint_mockup_single(
 
 
 # =========================================================
-# Multi-variant Endpoint
-#   - return_format=png → renders first style only (fast/low RAM)
-#   - ZIP/JSON supported for multiple styles
+# Multi-variant endpoint:
+# - If one style passed → generate 'variants' images (default 5)
+# - If multiple styles   → generate 1 per style (as before)
 # =========================================================
 @app.post("/outpaint/mockup")
 async def outpaint_mockup(
@@ -295,9 +298,10 @@ async def outpaint_mockup(
     styles: str = Form(",".join(DEFAULT_STYLE_LIST)),   # comma-separated list
     target_px: int = Form(DEFAULT_TARGET_PX),
     pad_ratio: float = Form(0.42),
-    make_print_previews: int = Form(0),                 # optional
+    make_print_previews: int = Form(0),                 # optional; can be heavy with many variants
     normalize_ratio: str = Form(""),
     mat_pct: float = Form(0.0),
+    variants: int = Form(5),                            # NEW: used only when exactly one style is provided
     return_format: str = Form("json"),                  # "json" | "png" | "zip"
     filename: str = Form("mockup_bundle"),
 ):
@@ -335,60 +339,61 @@ async def outpaint_mockup(
     canvas_bytes = _img_to_png_bytes(canvas)
     mask_bytes   = _img_to_png_bytes(mask)
 
-    # Fast path: PNG → first style only
+    one_style = len(style_list) == 1
+    n_per_style = max(1, min(int(variants), 10)) if one_style else 1
+
+    # Fast path: PNG → return only the first image generated
     if return_format.lower() == "png":
         style = style_list[0]
         prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
-        b64 = _openai_images_edit(canvas_bytes, mask_bytes, prompt=prompt, size="auto")
-        img_bytes = base64.b64decode(b64)
-        headers = {"Content-Disposition": f'inline; filename="{filename}_{style}.png"'}
+        b64_list = _openai_images_edit_multi(canvas_bytes, mask_bytes, prompt=prompt, n=n_per_style, size="auto")
+        img_bytes = base64.b64decode(b64_list[0])
+        suffix = "_v01" if n_per_style > 1 else ""
+        headers = {"Content-Disposition": f'inline; filename="{filename}_{style}{suffix}.png"'}
         return Response(content=img_bytes, media_type="image/png", headers=headers)
 
-    # Multi generation (JSON/ZIP)
-    results: List[Dict[str, str]] = []
+    # JSON / ZIP
+    results: List[Dict[str, object]] = []
     for style in style_list:
-        try:
-            prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
-            b64 = _openai_images_edit(canvas_bytes, mask_bytes, prompt=prompt, size="auto")
-            results.append({"style": style, "image_b64": b64})
-        except HTTPException as e:
-            results.append({"style": style, "error": str(e.detail)})
+        prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
+        b64_list = _openai_images_edit_multi(canvas_bytes, mask_bytes, prompt=prompt, n=n_per_style, size="auto")
+        # include both first and all variants
+        results.append({
+            "style": style,
+            "image_b64": b64_list[0],
+            "variants": b64_list,     # list of base64 strings
+        })
 
-    if not any("image_b64" in r for r in results):
-        raise HTTPException(status_code=502, detail={"message": "No mockups generated", "results": results})
-
-    # Optional previews
-    previews_map: Dict[str, Dict[str, str]] = {}
+    # Optional previews (can be heavy with many variants)
+    previews_map: Dict[str, Dict[str, Dict[str, str]]] = {}
     if make_print_previews:
         for item in results:
-            if "image_b64" not in item:
-                continue
-            key = item["style"]
-            img = Image.open(io.BytesIO(base64.b64decode(item["image_b64"]))).convert("RGBA")
-            pv: Dict[str, str] = {}
-            for name, wh in PRINT_SIZES.items():
-                thumb = _resize_fit(img, wh)
-                buf = io.BytesIO()
-                thumb.save(buf, "PNG")
-                pv[name] = base64.b64encode(buf.getvalue()).decode("utf-8")
-            previews_map[key] = pv
+            style = item["style"]
+            variants_b64 = item["variants"]
+            pv_style: Dict[str, Dict[str, str]] = {}
+            for i, b64 in enumerate(variants_b64, start=1):
+                img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+                pv_variant: Dict[str, str] = {}
+                for name, wh in PRINT_SIZES.items():
+                    thumb = _resize_fit(img, wh)
+                    buf = io.BytesIO()
+                    thumb.save(buf, "PNG")
+                    pv_variant[name] = base64.b64encode(buf.getvalue()).decode("utf-8")
+                pv_style[f"v{i:02d}"] = pv_variant
+            previews_map[style] = pv_style
 
     if return_format.lower() == "zip":
-        files_to_add: List[Tuple[str, bytes]] = []
-        for r in results:
-            if "image_b64" in r:
-                files_to_add.append((f'{filename}_{r["style"]}.png', base64.b64decode(r["image_b64"])))
-        if make_print_previews:
-            for style, pv in previews_map.items():
-                for name, b64s in pv.items():
-                    files_to_add.append((f"{filename}_{style}_preview_{name}.png", base64.b64decode(b64s)))
-        if not files_to_add:
-            raise HTTPException(status_code=502, detail="Nothing to add to ZIP (no successful images).")
-
         mem = io.BytesIO()
         with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for name, data in files_to_add:
-                zf.writestr(name, data)
+            for item in results:
+                style = item["style"]
+                for i, b64 in enumerate(item["variants"], start=1):
+                    zf.writestr(f"{filename}_{style}_v{i:02d}.png", base64.b64decode(b64))
+            if make_print_previews:
+                for style, pv in previews_map.items():
+                    for vkey, pv_set in pv.items():  # v01, v02, ...
+                        for name, b64s in pv_set.items():
+                            zf.writestr(f"{filename}_{style}_{vkey}_preview_{name}.png", base64.b64decode(b64s))
         zip_bytes = mem.getvalue()
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}.zip"',
@@ -399,11 +404,12 @@ async def outpaint_mockup(
     # default JSON
     return JSONResponse({
         "styles_requested": style_list,
+        "variants_per_style": n_per_style,
         "canvas_size": [canvas.width, canvas.height],
         "art_bbox": keep_bbox,
         "normalize_ratio": normalize_ratio,
         "mat_pct": mat_pct,
         "api_size": "auto",
-        "results": results,
-        "previews": previews_map,
+        "results": results,          # each has {"style", "image_b64", "variants":[...]}
+        "previews": previews_map,    # if requested
     })
