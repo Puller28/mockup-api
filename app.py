@@ -1,9 +1,9 @@
-# app.py — Outpainted Wall-Art Mockups (final, preserve-art, low-RAM)
-# - Safe ingest: EXIF fix, clamp longest edge, pixel guard
-# - Correct mask: alpha=255 KEEP (art), alpha=0 PAINT (around)
+# app.py — Outpainted Wall-Art Mockups (full-size ingest, preserve-art)
+# - NO pre-resize: uploads are used at full resolution (EXIF fixed, no scaling)
+# - Correct mask: alpha=255 KEEP (art), alpha=0 PAINT (around) + small keep expansion
 # - Strong preserve directive in every prompt
 # - Endpoints: /outpaint/mockup_single and /outpaint/mockup
-# - OpenAI Images/edits (gpt-image-1, size="auto")
+# - Uses OpenAI Images/edits (gpt-image-1, size="auto")
 
 import io
 import os
@@ -25,10 +25,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly corrupted files
 # Config / Presets
 # =========================
 
-# Safe defaults for a 512 MB instance; override via env on Render if needed.
-DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "1536"))         # canvas long side
-MAX_UPLOAD_SIDE   = int(os.getenv("MAX_UPLOAD_SIDE", "1600"))   # clamp upload longest edge
-MAX_PIXELS        = int(os.getenv("MAX_PIXELS", "12000000"))    # ~12 MP guard
+# No upload clamping; you control size upstream.
+DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))  # canvas long side (only used to scale UP if smaller)
 
 PRINT_SIZES: Dict[str, Tuple[int, int]] = {
     "4x5":   (1600, 2000),
@@ -74,7 +72,7 @@ PRESERVE_DIRECTIVE = (
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="2.0")
+app = FastAPI(title="Outpainted Wall-Art Mockups (REST, full-size ingest)", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,7 +87,7 @@ def healthz():
         "styles_available": list(STYLE_PROMPTS.keys()),
         "default_styles": DEFAULT_STYLE_LIST,
         "target_default": DEFAULT_TARGET_PX,
-        "upload_caps": {"MAX_UPLOAD_SIDE": MAX_UPLOAD_SIDE, "MAX_PIXELS": MAX_PIXELS},
+        "note": "Uploads are used full-size (no server-side downscale).",
     }
 
 
@@ -105,24 +103,13 @@ def _img_to_png_bytes(img: Image.Image) -> bytes:
 def _resize_fit(img: Image.Image, target: Tuple[int, int]) -> Image.Image:
     return ImageOps.contain(img, target, Image.LANCZOS)
 
-def _ingest_user_image(file_bytes: bytes, max_side: int = MAX_UPLOAD_SIDE) -> Image.Image:
+def _ingest_user_image_fullsize(file_bytes: bytes) -> Image.Image:
     """
-    Load safely, EXIF transpose, clamp longest edge, enforce pixel-count guard, return RGBA.
+    Load the uploaded image at original resolution.
+    Apply EXIF orientation, convert to RGBA. NO resizing.
     """
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img)
-
-    # Pixel guard (prevents huge decompressions)
-    if img.width * img.height > MAX_PIXELS:
-        scale = (MAX_PIXELS / float(img.width * img.height)) ** 0.5
-        new_w = max(1, int(img.width * scale))
-        new_h = max(1, int(img.height * scale))
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-
-    # Clamp longest edge
-    if max(img.size) > max_side:
-        img.thumbnail((max_side, max_side), Image.LANCZOS)
-
     if img.mode != "RGBA":
         img = img.convert("RGBA")
     return img
@@ -154,15 +141,14 @@ def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0))
 
 def _pad_canvas_keep_center(img: Image.Image, pad_ratio: float, target_side: int):
     """
-    Upscale to target_side (max edge) then add border by pad_ratio; returns (canvas, art_bbox).
-    target_side is capped to MAX_UPLOAD_SIDE for RAM safety.
+    Upscale to target_side (max edge) ONLY if image is smaller; never downscale.
+    Then add border by pad_ratio; returns (canvas, art_bbox).
     """
     img = img.convert("RGBA")
-    target_side = min(target_side, MAX_UPLOAD_SIDE)
 
     longest = max(img.size)
-    scale = max(1.0, target_side / float(longest))
-    if scale > 1.0:
+    if longest < target_side:
+        scale = target_side / float(longest)
         img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
 
     w, h = img.size
@@ -180,23 +166,22 @@ def _build_outpaint_mask(
     lock_pad_px: int = 3,   # expand keep a little to avoid edge bleed
 ) -> Image.Image:
     """
-    OpenAI Images/edits mask semantics (confirmed):
+    OpenAI Images/edits mask semantics:
       - alpha=0  (transparent) -> PAINT / REPLACE
       - alpha=255 (opaque)     -> KEEP AS-IS
-
     We make the artwork region fully opaque; everything else fully transparent.
     """
     W, H = canvas_size
     x0, y0, x1, y1 = keep_bbox
 
-    # Expand KEEP region slightly for safety
+    # Slight expansion prevents edge pixels from being repainted
     x0 = max(0, x0 - lock_pad_px)
     y0 = max(0, y0 - lock_pad_px)
     x1 = min(W, x1 + lock_pad_px)
     y1 = min(H, y1 + lock_pad_px)
 
-    alpha = Image.new("L", (W, H), 0)                 # paintable
-    keep = Image.new("L", (x1 - x0, y1 - y0), 255)    # locked
+    alpha = Image.new("L", (W, H), 0)               # paintable
+    keep = Image.new("L", (x1 - x0, y1 - y0), 255)  # locked
     alpha.paste(keep, (x0, y0))
 
     mask = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -222,7 +207,7 @@ def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size
     }
 
     try:
-        resp = requests.post(url, headers=headers, data=data, files=files, timeout=180)
+        resp = requests.post(url, headers=headers, data=data, files=files, timeout=300)
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Images API request failed: {e}")
 
@@ -236,7 +221,7 @@ def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size
 
 
 # =========================================================
-# Low-RAM Endpoint: one style only (recommended)
+# Low-RAM Endpoint: one style only (still safest)
 # =========================================================
 @app.post("/outpaint/mockup_single")
 async def outpaint_mockup_single(
@@ -252,13 +237,13 @@ async def outpaint_mockup_single(
     if style not in STYLE_PROMPTS:
         raise HTTPException(400, f"Unknown style '{style}'. Choose from {list(STYLE_PROMPTS.keys())}")
 
-    # Safe ingest
+    # FULL-SIZE ingest (no downscale)
     try:
-        art = _ingest_user_image(await file.read(), max_side=MAX_UPLOAD_SIDE)
+        art = _ingest_user_image_fullsize(await file.read())
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
-    # Optional ratio pad
+    # Optional ratio pad (no crop)
     if normalize_ratio:
         try:
             rw, rh = [int(x) for x in normalize_ratio.split(":")]
@@ -279,9 +264,7 @@ async def outpaint_mockup_single(
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
 
-    # Prompt with preserve directive
     prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
-
     b64 = _openai_images_edit(_img_to_png_bytes(canvas), _img_to_png_bytes(mask),
                               prompt=prompt, size="auto")
 
@@ -296,16 +279,15 @@ async def outpaint_mockup_single(
             "image_b64": b64
         })
 
-    # default PNG
     img_bytes = base64.b64decode(b64)
     headers = {"Content-Disposition": f'inline; filename="{filename}_{style}.png"'}
     return Response(content=img_bytes, media_type="image/png", headers=headers)
 
 
 # =========================================================
-# Multi-variant Endpoint (use when needed)
+# Multi-variant Endpoint
 #   - return_format=png → renders first style only (fast/low RAM)
-#   - ZIP/JSON supported for multiple styles (watch memory)
+#   - ZIP/JSON supported for multiple styles
 # =========================================================
 @app.post("/outpaint/mockup")
 async def outpaint_mockup(
@@ -313,7 +295,7 @@ async def outpaint_mockup(
     styles: str = Form(",".join(DEFAULT_STYLE_LIST)),   # comma-separated list
     target_px: int = Form(DEFAULT_TARGET_PX),
     pad_ratio: float = Form(0.42),
-    make_print_previews: int = Form(0),                 # default 0 to save RAM
+    make_print_previews: int = Form(0),                 # optional
     normalize_ratio: str = Form(""),
     mat_pct: float = Form(0.0),
     return_format: str = Form("json"),                  # "json" | "png" | "zip"
@@ -326,9 +308,9 @@ async def outpaint_mockup(
     if not style_list:
         raise HTTPException(400, "No valid styles provided.")
 
-    # Safe ingest
+    # FULL-SIZE ingest
     try:
-        art = _ingest_user_image(await file.read(), max_side=MAX_UPLOAD_SIDE)
+        art = _ingest_user_image_fullsize(await file.read())
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
@@ -375,7 +357,7 @@ async def outpaint_mockup(
     if not any("image_b64" in r for r in results):
         raise HTTPException(status_code=502, detail={"message": "No mockups generated", "results": results})
 
-    # Optional previews (watch memory)
+    # Optional previews
     previews_map: Dict[str, Dict[str, str]] = {}
     if make_print_previews:
         for item in results:
