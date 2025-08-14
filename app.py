@@ -1,8 +1,9 @@
-# app.py — Outpainted Wall-Art Mockups
-# - Low-RAM safe ingest (EXIF fix, clamp longest edge, pixel guard)
-# - Single-style endpoint (/outpaint/mockup_single) → PNG/JSON
-# - Multi-variant endpoint (/outpaint/mockup) → JSON/PNG/ZIP
-# - Uses OpenAI Images Edits (gpt-image-1) with size="auto"
+# app.py — Outpainted Wall-Art Mockups (final, preserve-art, low-RAM)
+# - Safe ingest: EXIF fix, clamp longest edge, pixel guard
+# - Correct mask: alpha=255 KEEP (art), alpha=0 PAINT (around)
+# - Strong preserve directive in every prompt
+# - Endpoints: /outpaint/mockup_single and /outpaint/mockup
+# - OpenAI Images/edits (gpt-image-1, size="auto")
 
 import io
 import os
@@ -17,18 +18,17 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps, ImageFile
 
-# Be tolerant of slightly broken files
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly corrupted files
 
 
 # =========================
 # Config / Presets
 # =========================
 
-# For 512MB instances these are safe defaults; override via Render env vars.
-DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "1536"))     # generation canvas long side
-MAX_UPLOAD_SIDE   = int(os.getenv("MAX_UPLOAD_SIDE", "1600"))  # clamp uploaded art longest edge
-MAX_PIXELS        = int(os.getenv("MAX_PIXELS", "12000000"))   # ~12MP guard (e.g., 4000x3000)
+# Safe defaults for a 512 MB instance; override via env on Render if needed.
+DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "1536"))         # canvas long side
+MAX_UPLOAD_SIDE   = int(os.getenv("MAX_UPLOAD_SIDE", "1600"))   # clamp upload longest edge
+MAX_PIXELS        = int(os.getenv("MAX_PIXELS", "12000000"))    # ~12 MP guard
 
 PRINT_SIZES: Dict[str, Tuple[int, int]] = {
     "4x5":   (1600, 2000),
@@ -40,7 +40,7 @@ PRINT_SIZES: Dict[str, Tuple[int, int]] = {
 
 STYLE_PROMPTS: Dict[str, str] = {
     "living_room": (
-        "Create a realistic interior mockup AROUND the existing artwork. Keep the artwork exactly as-is. "
+        "Create a realistic interior mockup AROUND the existing artwork. "
         "Paint a modern living room: matte neutral wall with subtle texture, focused ceiling spotlight, "
         "thin black metal frame with correct perspective and natural shadows. Minimalist, photorealistic, no text."
     ),
@@ -63,12 +63,18 @@ STYLE_PROMPTS: Dict[str, str] = {
 }
 DEFAULT_STYLE_LIST = ["living_room", "bedroom", "study", "gallery", "kitchen"]
 
+PRESERVE_DIRECTIVE = (
+    "IMPORTANT: Preserve the existing artwork pixels exactly as-is within the KEEP region of the mask. "
+    "Do not modify, blur, repaint, recompose, or regenerate any part of the artwork. "
+    "Only generate the surrounding wall, frame, lighting and room context outside the artwork region."
+)
+
 
 # =========================
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="1.7")
+app = FastAPI(title="Outpainted Wall-Art Mockups (REST)", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,14 +107,12 @@ def _resize_fit(img: Image.Image, target: Tuple[int, int]) -> Image.Image:
 
 def _ingest_user_image(file_bytes: bytes, max_side: int = MAX_UPLOAD_SIDE) -> Image.Image:
     """
-    Load the uploaded image safely, apply EXIF orientation,
-    clamp longest edge to max_side, enforce pixel-count guard,
-    and convert to RGBA for consistent downstream handling.
+    Load safely, EXIF transpose, clamp longest edge, enforce pixel-count guard, return RGBA.
     """
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img)
 
-    # Pixel-count guard: if decompressed size is huge, downscale proportionally
+    # Pixel guard (prevents huge decompressions)
     if img.width * img.height > MAX_PIXELS:
         scale = (MAX_PIXELS / float(img.width * img.height)) ** 0.5
         new_w = max(1, int(img.width * scale))
@@ -149,10 +153,11 @@ def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0))
     return canvas, (x0, y0, x0 + w, y0 + h)
 
 def _pad_canvas_keep_center(img: Image.Image, pad_ratio: float, target_side: int):
-    """Upscale to target_side (max edge) then add border by pad_ratio; returns (canvas, art_bbox)."""
+    """
+    Upscale to target_side (max edge) then add border by pad_ratio; returns (canvas, art_bbox).
+    target_side is capped to MAX_UPLOAD_SIDE for RAM safety.
+    """
     img = img.convert("RGBA")
-
-    # Cap target_side to upload clamp as an extra RAM safeguard
     target_side = min(target_side, MAX_UPLOAD_SIDE)
 
     longest = max(img.size)
@@ -172,40 +177,34 @@ def _pad_canvas_keep_center(img: Image.Image, pad_ratio: float, target_side: int
 def _build_outpaint_mask(
     canvas_size: Tuple[int, int],
     keep_bbox: Tuple[int, int, int, int],
-    lock_pad_px: int = 2,
+    lock_pad_px: int = 3,   # expand keep a little to avoid edge bleed
 ) -> Image.Image:
     """
-    OpenAI Images/edits mask:
-      - Transparent (alpha=0) = KEEP ORIGINAL
-      - Opaque (alpha=255)    = PAINT / REPLACE
+    OpenAI Images/edits mask semantics (confirmed):
+      - alpha=0  (transparent) -> PAINT / REPLACE
+      - alpha=255 (opaque)     -> KEEP AS-IS
 
-    We make the art area fully transparent, the rest fully opaque.
+    We make the artwork region fully opaque; everything else fully transparent.
     """
     W, H = canvas_size
     x0, y0, x1, y1 = keep_bbox
 
-    # Expand keep box a little
+    # Expand KEEP region slightly for safety
     x0 = max(0, x0 - lock_pad_px)
     y0 = max(0, y0 - lock_pad_px)
     x1 = min(W, x1 + lock_pad_px)
     y1 = min(H, y1 + lock_pad_px)
 
-    # Alpha channel: fully opaque everywhere
-    alpha = Image.new("L", (W, H), 255)
+    alpha = Image.new("L", (W, H), 0)                 # paintable
+    keep = Image.new("L", (x1 - x0, y1 - y0), 255)    # locked
+    alpha.paste(keep, (x0, y0))
 
-    # Paste a fully transparent area for the KEEP region
-    hole = Image.new("L", (x1 - x0, y1 - y0), 0)
-    alpha.paste(hole, (x0, y0))
-
-    # Combine into RGBA (black background, but only alpha matters)
-    mask = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+    mask = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     mask.putalpha(alpha)
     return mask
 
-
-
 def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size: str = "auto") -> str:
-    """Call OpenAI Images/edits with multipart. Returns first image's base64."""
+    """Call OpenAI Images/edits (multipart). Returns first image's base64."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set on server")
@@ -242,23 +241,24 @@ def _openai_images_edit(image_bytes: bytes, mask_bytes: bytes, prompt: str, size
 @app.post("/outpaint/mockup_single")
 async def outpaint_mockup_single(
     file: UploadFile = File(...),
-    style: str = Form("living_room"),          # one of STYLE_PROMPTS
+    style: str = Form("living_room"),
     target_px: int = Form(DEFAULT_TARGET_PX),
     pad_ratio: float = Form(0.42),
-    normalize_ratio: str = Form(""),           # e.g. "4:5", "3:4", "2:3"
-    mat_pct: float = Form(0.0),                # 0.0–0.1 typical
+    normalize_ratio: str = Form(""),
+    mat_pct: float = Form(0.0),
     return_format: str = Form("png"),          # "png" | "json"
     filename: str = Form("mockup_single"),
 ):
     if style not in STYLE_PROMPTS:
         raise HTTPException(400, f"Unknown style '{style}'. Choose from {list(STYLE_PROMPTS.keys())}")
 
-    # Safe ingest (EXIF fix, clamp, pixel guard)
+    # Safe ingest
     try:
         art = _ingest_user_image(await file.read(), max_side=MAX_UPLOAD_SIDE)
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
+    # Optional ratio pad
     if normalize_ratio:
         try:
             rw, rh = [int(x) for x in normalize_ratio.split(":")]
@@ -266,6 +266,7 @@ async def outpaint_mockup_single(
         except Exception:
             raise HTTPException(400, f"Invalid normalize_ratio '{normalize_ratio}'. Use '4:5', '3:4', '2:3'.")
 
+    # Optional mat
     if mat_pct and mat_pct > 0:
         w, h = art.size
         mx = int(w * mat_pct / 2.0)
@@ -274,12 +275,15 @@ async def outpaint_mockup_single(
         mat_canvas.paste(art, (mx, my), art)
         art = mat_canvas
 
-    # Canvas + mask (with target_px capped internally)
+    # Canvas + mask
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
 
+    # Prompt with preserve directive
+    prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
+
     b64 = _openai_images_edit(_img_to_png_bytes(canvas), _img_to_png_bytes(mask),
-                              prompt=STYLE_PROMPTS[style], size="auto")
+                              prompt=prompt, size="auto")
 
     if return_format.lower() == "json":
         return JSONResponse({
@@ -352,7 +356,8 @@ async def outpaint_mockup(
     # Fast path: PNG → first style only
     if return_format.lower() == "png":
         style = style_list[0]
-        b64 = _openai_images_edit(canvas_bytes, mask_bytes, prompt=STYLE_PROMPTS[style], size="auto")
+        prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
+        b64 = _openai_images_edit(canvas_bytes, mask_bytes, prompt=prompt, size="auto")
         img_bytes = base64.b64decode(b64)
         headers = {"Content-Disposition": f'inline; filename="{filename}_{style}.png"'}
         return Response(content=img_bytes, media_type="image/png", headers=headers)
@@ -361,7 +366,8 @@ async def outpaint_mockup(
     results: List[Dict[str, str]] = []
     for style in style_list:
         try:
-            b64 = _openai_images_edit(canvas_bytes, mask_bytes, prompt=STYLE_PROMPTS[style], size="auto")
+            prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
+            b64 = _openai_images_edit(canvas_bytes, mask_bytes, prompt=prompt, size="auto")
             results.append({"style": style, "image_b64": b64})
         except HTTPException as e:
             results.append({"style": style, "error": str(e.detail)})
