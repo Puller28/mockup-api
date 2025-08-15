@@ -1,15 +1,19 @@
-# app.py — Outpainted Wall-Art Mockups (alignment-safe)
-# Fix: Always call OpenAI at a supported edit size (1024x1024, 1024x1536, 1536x1024),
-# then scale result back to our original canvas size before re-overlaying the artwork.
+# app.py — Outpainted Mockups (alignment-safe, pre-resize TOGGLE)
+# Default: use the uploaded image as-is (no front-door resize).
+# If pre_resize=1 is passed, we shrink at ingest under configurable limits.
+#
+# Canvas + mask always share identical geometry.
+# For OpenAI, we quantize to a supported edit size (1024^2, 1024x1536, 1536x1024),
+# then scale the result back to the original canvas before optional overlay.
 
 import io
 import os
 import base64
-import requests
 import zipfile
 from math import ceil
 from typing import Dict, Tuple, List
 
+import requests
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,19 +21,12 @@ from PIL import Image, ImageOps, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+
 # =========================
 # Config / Presets
 # =========================
 
-DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))  # upscale only if smaller
-
-PRINT_SIZES: Dict[str, Tuple[int, int]] = {
-    "4x5":   (1600, 2000),
-    "3x4":   (1536, 2048),
-    "2x3":   (1600, 2400),
-    "11x14": (1650, 2100),
-    "A4":    (1654, 2339),
-}
+DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))  # upscale only if image shorter on long side
 
 STYLE_PROMPTS: Dict[str, str] = {
     "living_room": (
@@ -58,15 +55,24 @@ DEFAULT_STYLE_LIST = ["living_room", "bedroom", "study", "gallery", "kitchen"]
 
 PRESERVE_DIRECTIVE = (
     "IMPORTANT: Preserve the existing artwork pixels exactly as-is within the KEEP region of the mask. "
-    "Do not modify, blur, repaint, recompose, or regenerate ANY part of the artwork. "
-    "Only generate the surrounding wall, frame, lighting and room context OUTSIDE the artwork region."
+    "Do not modify, blur, repaint, or regenerate any artwork pixels. "
+    "Do not overlap the kept region with frame or mat; leave a clean thin gap; nothing should cover the art."
 )
+
+PRINT_SIZES: Dict[str, Tuple[int, int]] = {
+    "4x5":   (1600, 2000),
+    "3x4":   (1536, 2048),
+    "2x3":   (1600, 2400),
+    "11x14": (1650, 2100),
+    "A4":    (1654, 2339),
+}
+
 
 # =========================
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Mockups (alignment-safe)", version="3.4")
+app = FastAPI(title="Outpainted Mockups (toggle pre-resize)", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,8 +87,9 @@ def healthz():
         "styles_available": list(STYLE_PROMPTS.keys()),
         "default_styles": DEFAULT_STYLE_LIST,
         "target_default": DEFAULT_TARGET_PX,
-        "note": "Uses API-safe edit sizes to guarantee overlay alignment.",
+        "note": "pre_resize is OFF by default; pass pre_resize=1 to enable ingest shrinking.",
     }
+
 
 # =========================
 # Helpers
@@ -101,14 +108,52 @@ def _img_to_jpeg_bytes(img: Image.Image, quality: int = 90) -> bytes:
 def _resize_fit(img: Image.Image, target: Tuple[int, int]) -> Image.Image:
     return ImageOps.contain(img, target, Image.LANCZOS)
 
-def _ingest_user_image_fullsize(file_bytes: bytes) -> Image.Image:
+def _ingest_user_image(file_bytes: bytes, pre_resize: bool, max_side: int, max_bytes: int) -> Image.Image:
+    """
+    Ingest upload. If pre_resize is True:
+      - downscale to <= max_side (keep ratio) if larger
+      - (JPEG path) binary search quality to get under max_bytes, else iterative downscale
+    Always returns RGBA.
+    """
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img)
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    return img
+
+    if not pre_resize:
+        return img.convert("RGBA")
+
+    # Downscale if needed
+    if max(img.size) > max_side:
+        s = max_side / float(max(img.size))
+        img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
+
+    # Try to keep PNG if small; otherwise JPEG quality search
+    png_bytes = _img_to_png_bytes(img)
+    if len(png_bytes) <= max_bytes:
+        return Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+
+    lo, hi = 60, 92
+    best = _img_to_jpeg_bytes(img, hi)
+    if len(best) > max_bytes:
+        # binary search quality
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cand = _img_to_jpeg_bytes(img, mid)
+            if len(cand) <= max_bytes:
+                best = cand
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+    # If still too big, iterative 0.9 scale until within limit or small
+    cur = best
+    while len(cur) > max_bytes and max(img.size) > 512:
+        img = img.resize((int(img.width * 0.9), int(img.height * 0.9)), Image.LANCZOS)
+        cur = _img_to_jpeg_bytes(img, 90)
+
+    return Image.open(io.BytesIO(cur)).convert("RGBA")
 
 def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0)):
+    """Pad to exact ratio without scaling (letterbox), return (canvas, bbox_of_img)."""
     img = img.convert("RGBA")
     w, h = img.size
     target_ratio = ratio_w / ratio_h
@@ -117,12 +162,14 @@ def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0))
         canvas = Image.new("RGBA", (w, h), bg)
         canvas.paste(img, (0, 0), img)
         return canvas, (0, 0, w, h)
+
     if src_ratio > target_ratio:
         canvas_w = w
         canvas_h = ceil(w / target_ratio)
     else:
         canvas_h = h
         canvas_w = ceil(h * target_ratio)
+
     canvas = Image.new("RGBA", (canvas_w, canvas_h), bg)
     x0 = (canvas_w - w) // 2
     y0 = (canvas_h - h) // 2
@@ -132,7 +179,7 @@ def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0))
 def _pad_canvas_keep_center(img: Image.Image, pad_ratio: float, target_side: int):
     """
     Upscale to target_side (max edge) ONLY if image is smaller; never downscale.
-    Then add border by pad_ratio; returns (canvas, art_bbox).
+    Then add border by pad_ratio; returns (canvas_rgba, art_bbox_on_canvas).
     """
     img = img.convert("RGBA")
     longest = max(img.size)
@@ -165,9 +212,21 @@ def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int
     mask.putalpha(alpha)
     return mask
 
-def _overlay_original_art(result_rgba: Image.Image, art_rgba: Image.Image, bbox: Tuple[int, int, int, int]) -> Image.Image:
-    """Guarantee pixel-perfect preservation by pasting the original art back into the final image."""
+def _overlay_original_art(result_rgba: Image.Image, art_rgba: Image.Image,
+                          bbox: Tuple[int, int, int, int], inset_px: int = 0) -> Image.Image:
+    """
+    Paste original art back into the final image.
+    If inset_px > 0, inset the destination rectangle to leave a thin margin (hides tiny misalignments).
+    """
     x0, y0, x1, y1 = bbox
+    if inset_px > 0:
+        x0 += inset_px
+        y0 += inset_px
+        x1 -= inset_px
+        y1 -= inset_px
+        if x1 <= x0 or y1 <= y0:
+            x0, y0, x1, y1 = bbox
+
     w, h = x1 - x0, y1 - y0
     if art_rgba.size != (w, h):
         art_rgba = art_rgba.resize((w, h), Image.LANCZOS)
@@ -175,14 +234,12 @@ def _overlay_original_art(result_rgba: Image.Image, art_rgba: Image.Image, bbox:
     out.paste(art_rgba, (x0, y0), art_rgba)
     return out
 
-# ---------- API size helper (prevents misalignment) ----------
 def _api_edit_size_for(canvas_size: Tuple[int, int]) -> Tuple[int, int, str]:
     """
-    Choose an OpenAI-supported edit size matching orientation:
+    Pick OpenAI-supported edit size matching orientation:
       - Portrait  -> 1024x1536
       - Landscape -> 1536x1024
       - Square    -> 1024x1024
-    Returns (w, h, size_str).
     """
     W, H = canvas_size
     if W == H:
@@ -219,8 +276,9 @@ def _openai_images_edit_multi(image_png: bytes, mask_png: bytes, prompt: str, n:
         raise HTTPException(status_code=502, detail=f"Image API returned no data: {js}")
     return [it.get("b64_json") for it in items if it.get("b64_json")]
 
+
 # =========================
-# Utility: shrink ≤ 1 MB (unchanged)
+# Utility: shrink ≤ 1 MB (helper)
 # =========================
 @app.post("/utils/fit_under_1mb")
 async def fit_under_1mb(
@@ -283,8 +341,9 @@ async def fit_under_1mb(
         "image_b64": b64
     })
 
+
 # =========================================================
-# Single-style endpoint (alignment-safe)
+# Single-style endpoint
 # =========================================================
 @app.post("/outpaint/mockup_single")
 async def outpaint_mockup_single(
@@ -294,7 +353,12 @@ async def outpaint_mockup_single(
     pad_ratio: float = Form(0.42),
     normalize_ratio: str = Form(""),
     mat_pct: float = Form(0.0),
-    overlay_original: int = Form(1),
+    overlay_original: int = Form(0),          # default OFF to avoid seams
+    overlay_inset_px: int = Form(0),          # if overlay=1, use 1–3 to hide frame misalign
+    # TOGGLE for front-door resize:
+    pre_resize: int = Form(0),
+    pre_max_side: int = Form(3000),
+    pre_max_bytes: int = Form(1_000_000),
     return_format: str = Form("png"),
     filename: str = Form("mockup_single"),
 ):
@@ -302,7 +366,8 @@ async def outpaint_mockup_single(
         raise HTTPException(400, f"Unknown style '{style}'. Choose from {list(STYLE_PROMPTS.keys())}")
 
     try:
-        art = _ingest_user_image_fullsize(await file.read())
+        raw = await file.read()
+        art = _ingest_user_image(raw, bool(pre_resize), int(pre_max_side), int(pre_max_bytes))
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
@@ -321,11 +386,11 @@ async def outpaint_mockup_single(
         mat_canvas.paste(art, (mx, my), art)
         art = mat_canvas
 
-    # Build free-size canvas & mask
+    # Build free-size canvas + mask at the same geometry
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
 
-    # Create API-safe versions (and remember original canvas size)
+    # Quantize to OpenAI edit size together
     api_w, api_h, api_size_str = _api_edit_size_for(canvas.size)
     canvas_api = canvas.resize((api_w, api_h), Image.LANCZOS)
     mask_api   = mask.resize((api_w, api_h), Image.NEAREST)
@@ -339,7 +404,6 @@ async def outpaint_mockup_single(
         size_str=api_size_str,
     )[0]
 
-    # Bring API result back to our original canvas size
     out = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
     if out.size != canvas.size:
         out = out.resize(canvas.size, Image.LANCZOS)
@@ -347,11 +411,10 @@ async def outpaint_mockup_single(
     if overlay_original:
         x0, y0, x1, y1 = keep_bbox
         placed_art = canvas.crop((x0, y0, x1, y1))
-        out = _overlay_original_art(out, placed_art, keep_bbox)
+        out = _overlay_original_art(out, placed_art, keep_bbox, inset_px=max(0, int(overlay_inset_px)))
 
     if return_format.lower() == "json":
-        buf = io.BytesIO()
-        out.save(buf, "PNG")
+        buf = io.BytesIO(); out.save(buf, "PNG")
         return JSONResponse({
             "style": style,
             "canvas_size": [canvas.width, canvas.height],
@@ -359,16 +422,17 @@ async def outpaint_mockup_single(
             "normalize_ratio": normalize_ratio,
             "mat_pct": mat_pct,
             "api_size": api_size_str,
+            "pre_resize": int(pre_resize),
             "image_b64": base64.b64encode(buf.getvalue()).decode("utf-8")
         })
 
-    buf = io.BytesIO()
-    out.save(buf, "PNG")
+    buf = io.BytesIO(); out.save(buf, "PNG")
     headers = {"Content-Disposition": f'inline; filename="{filename}_{style}.png"'}
     return Response(content=buf.getvalue(), media_type="image/png", headers=headers)
 
+
 # =========================================================
-# Multi-variant/style endpoint (alignment-safe)
+# Multi-style / multi-variant endpoint
 # =========================================================
 @app.post("/outpaint/mockup")
 async def outpaint_mockup(
@@ -379,8 +443,13 @@ async def outpaint_mockup(
     normalize_ratio: str = Form(""),
     mat_pct: float = Form(0.0),
     variants: int = Form(5),
-    overlay_original: int = Form(1),
+    overlay_original: int = Form(0),
+    overlay_inset_px: int = Form(0),
     make_print_previews: int = Form(0),
+    # TOGGLE for front-door resize:
+    pre_resize: int = Form(0),
+    pre_max_side: int = Form(3000),
+    pre_max_bytes: int = Form(1_000_000),
     return_format: str = Form("json"),
     filename: str = Form("mockup_bundle"),
 ):
@@ -392,7 +461,8 @@ async def outpaint_mockup(
         raise HTTPException(400, "No valid styles provided.")
 
     try:
-        art = _ingest_user_image_fullsize(await file.read())
+        raw = await file.read()
+        art = _ingest_user_image(raw, bool(pre_resize), int(pre_max_side), int(pre_max_bytes))
     except Exception as e:
         raise HTTPException(400, f"Could not read image: {e}")
 
@@ -411,7 +481,7 @@ async def outpaint_mockup(
         mat_canvas.paste(art, (mx, my), art)
         art = mat_canvas
 
-    # Build free-size canvas & mask once
+    # Build free-size canvas + mask once
     canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
     mask = _build_outpaint_mask(canvas.size, keep_bbox)
 
@@ -423,21 +493,22 @@ async def outpaint_mockup(
     one_style = len(style_list) == 1
     n_per_style = max(1, min(int(variants), 10)) if one_style else 1
 
-    # Fast PNG path -> first variant of first style
+    # Fast PNG path (first variant of first style)
     if return_format.lower() == "png":
         style = style_list[0]
         prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
-        b64_list = _openai_images_edit_multi(_img_to_png_bytes(canvas_api), _img_to_png_bytes(mask_api),
-                                             prompt=prompt, n=n_per_style, size_str=api_size_str)
+        b64_list = _openai_images_edit_multi(
+            _img_to_png_bytes(canvas_api), _img_to_png_bytes(mask_api),
+            prompt=prompt, n=n_per_style, size_str=api_size_str
+        )
         out = Image.open(io.BytesIO(base64.b64decode(b64_list[0]))).convert("RGBA")
         if out.size != canvas.size:
             out = out.resize(canvas.size, Image.LANCZOS)
         if overlay_original:
             x0, y0, x1, y1 = keep_bbox
             placed_art = canvas.crop((x0, y0, x1, y1))
-            out = _overlay_original_art(out, placed_art, keep_bbox)
-        buf = io.BytesIO()
-        out.save(buf, "PNG")
+            out = _overlay_original_art(out, placed_art, keep_bbox, inset_px=max(0, int(overlay_inset_px)))
+        buf = io.BytesIO(); out.save(buf, "PNG")
         suffix = "_v01" if n_per_style > 1 else ""
         headers = {"Content-Disposition": f'inline; filename="{filename}_{style}{suffix}.png"'}
         return Response(content=buf.getvalue(), media_type="image/png", headers=headers)
@@ -447,8 +518,10 @@ async def outpaint_mockup(
 
     for style in style_list:
         prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
-        b64_list = _openai_images_edit_multi(_img_to_png_bytes(canvas_api), _img_to_png_bytes(mask_api),
-                                             prompt=prompt, n=n_per_style, size_str=api_size_str)
+        b64_list = _openai_images_edit_multi(
+            _img_to_png_bytes(canvas_api), _img_to_png_bytes(mask_api),
+            prompt=prompt, n=n_per_style, size_str=api_size_str
+        )
 
         fixed_b64_list: List[str] = []
         for b64 in b64_list:
@@ -458,16 +531,16 @@ async def outpaint_mockup(
             if overlay_original:
                 x0, y0, x1, y1 = keep_bbox
                 placed_art = canvas.crop((x0, y0, x1, y1))
-                img = _overlay_original_art(img, placed_art, keep_bbox)
-            buf = io.BytesIO()
-            img.save(buf, "PNG")
+                img = _overlay_original_art(img, placed_art, keep_bbox, inset_px=max(0, int(overlay_inset_px)))
+            buf = io.BytesIO(); img.save(buf, "PNG")
             fixed_b64_list.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
 
         results.append({
             "style": style,
+            "api_size": api_size_str,
+            "pre_resize": int(pre_resize),
             "image_b64": fixed_b64_list[0],
             "variants": fixed_b64_list,
-            "api_size": api_size_str,
         })
 
         if make_print_previews:
@@ -477,8 +550,7 @@ async def outpaint_mockup(
                 pv_variant: Dict[str, str] = {}
                 for name, wh in PRINT_SIZES.items():
                     thumb = _resize_fit(img, wh)
-                    tbuf = io.BytesIO()
-                    thumb.save(tbuf, "PNG")
+                    tbuf = io.BytesIO(); thumb.save(tbuf, "PNG")
                     pv_variant[name] = base64.b64encode(tbuf.getvalue()).decode("utf-8")
                 pv_style[f"v{i:02d}"] = pv_variant
             previews_map[style] = pv_style
@@ -489,17 +561,15 @@ async def outpaint_mockup(
             for item in results:
                 style = item["style"]
                 for i, b64 in enumerate(item["variants"], start=1):
-                    zf.writestr(f"{filename}_{style}_v{i:02d}.png", base64.bdecode(b64) if hasattr(base64, "bdecode") else base64.b64decode(b64))
+                    zf.writestr(f"{filename}_{style}_v{i:02d}.png", base64.b64decode(b64))
             if make_print_previews:
                 for style, pv in previews_map.items():
                     for vkey, pv_set in pv.items():
                         for name, b64s in pv_set.items():
                             zf.writestr(f"{filename}_{style}_{vkey}_preview_{name}.png", base64.b64decode(b64s))
         zip_bytes = mem.getvalue()
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}.zip"',
-            "Content-Length": str(len(zip_bytes)),
-        }
+        headers = {"Content-Disposition": f'attachment; filename="{filename}.zip'",
+                   "Content-Length": str(len(zip_bytes))}
         return Response(content=zip_bytes, media_type="application/zip", headers=headers)
 
     return JSONResponse({
@@ -510,6 +580,7 @@ async def outpaint_mockup(
         "normalize_ratio": normalize_ratio,
         "mat_pct": mat_pct,
         "api_size": api_size_str,
+        "pre_resize": int(pre_resize),
         "results": results,
         "previews": previews_map,
     })
