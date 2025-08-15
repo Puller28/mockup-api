@@ -568,8 +568,9 @@ async def outpaint_mockup(
                         for name, b64s in pv_set.items():
                             zf.writestr(f"{filename}_{style}_{vkey}_preview_{name}.png", base64.b64decode(b64s))
         zip_bytes = mem.getvalue()
-        headers = {"Content-Disposition": f'attachment; filename="{filename}.zip'",
-                   "Content-Length": str(len(zip_bytes))}
+        headers = {"Content-Disposition": f'attachment; filename="{filename}.zip"',
+           "Content-Length": str(len(zip_bytes))}
+
         return Response(content=zip_bytes, media_type="application/zip", headers=headers)
 
     return JSONResponse({
