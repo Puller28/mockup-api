@@ -243,66 +243,6 @@ def _openai_images_edit_multi(image_png: bytes, mask_png: bytes, prompt: str, n:
         raise HTTPException(status_code=502, detail=f"Image API returned no data: {js}")
     return [it.get("b64_json") for it in items if it.get("b64_json")]
 
-# =========================
-# Utility — optional fit under 1MB (unchanged)
-# =========================
-@app.post("/utils/fit_under_1mb")
-async def fit_under_1mb(
-    file: UploadFile = File(...),
-    max_bytes: int = Form(1_000_000),
-    max_side: int = Form(4096),
-    format: str = Form("jpeg"),
-    min_quality: int = Form(60),
-):
-    raw = await file.read()
-    img = Image.open(io.BytesIO(raw))
-    img = ImageOps.exif_transpose(img)
-    if max(img.size) > max_side:
-        s = max_side / float(max(img.size))
-        img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
-
-    if format.lower() == "png":
-        cur = _img_to_png_bytes(img)
-        while len(cur) > max_bytes and max(img.size) > 512:
-            img = img.resize((int(img.width * 0.9), int(img.height * 0.9)), Image.LANCZOS)
-            cur = _img_to_png_bytes(img)
-        out_b = cur
-        mime = "image/png"
-        ext = "png"
-    else:
-        # JPEG path with binary search + gentle downscale loop
-        def _jpeg(img_, q): 
-            b = io.BytesIO(); img_.convert("RGB").save(b, "JPEG", quality=q, optimize=True); return b.getvalue()
-        lo, hi = min_quality, 95
-        best = _jpeg(img, hi)
-        if len(best) > max_bytes:
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                cand = _jpeg(img, mid)
-                if len(cand) <= max_bytes:
-                    best = cand; lo = mid + 1
-                else:
-                    hi = mid - 1
-        while len(best) > max_bytes and max(img.size) > 512:
-            img = img.resize((int(img.width * 0.92), int(img.height * 0.92)), Image.LANCZOS)
-            lo, hi = min_quality, 90
-            best = _jpeg(img, hi)
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                cand = _jpeg(img, mid)
-                if len(cand) <= max_bytes:
-                    best = cand; lo = mid + 1
-                else:
-                    hi = mid - 1
-        out_b = best
-        mime = "image/jpeg"
-        ext = "jpg"
-
-    b64 = base64.b64encode(out_b).decode("utf-8")
-    return JSONResponse({
-        "format": ext, "mime": mime, "size_bytes": len(out_b),
-        "width": img.width, "height": img.height, "image_b64": b64
-    })
 
 # =========================================================
 # Single-style endpoint
