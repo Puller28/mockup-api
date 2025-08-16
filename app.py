@@ -1,9 +1,7 @@
-# app.py — Outpainted Mockups (simple ingest resize + alignment-safe pipeline)
-# 1) Ingest: optional proportional resize if long edge > ingest_max_long_edge (aspect ratio preserved)
-# 2) Build canvas + mask from that exact raster
-# 3) Quantize (canvas+mask) to OpenAI edit size (1024^2, 1024x1536, 1536x1024), call API
-# 4) Scale result back to original canvas size
-# 5) (Optional) Re-overlay original art with tiny inset to avoid seams
+# app.py — Outpainted Mockups (multi-only, alignment-safe, simple ingest resize)
+# Endpoints:
+#   GET  /healthz
+#   POST /outpaint/mockup     ← the only generator endpoint
 
 import io
 import os
@@ -24,7 +22,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # Config / Presets
 # =========================
 
-DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))          # upscale only if art is smaller
+DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))                # upscale only if art is smaller
 DEFAULT_INGEST_LONG_EDGE = int(os.getenv("INGEST_LONG_EDGE", "2048"))  # simple proportional downscale
 OPENAI_MODEL = os.getenv("OPENAI_IMAGES_MODEL", "gpt-image-1")
 
@@ -71,7 +69,7 @@ PRINT_SIZES: Dict[str, Tuple[int, int]] = {
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Outpainted Mockups (simple ingest resize)", version="4.1")
+app = FastAPI(title="Outpainted Mockups (multi-only)", version="5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,7 +85,7 @@ def healthz():
         "default_styles": DEFAULT_STYLE_LIST,
         "target_default": DEFAULT_TARGET_PX,
         "ingest_long_edge_default": DEFAULT_INGEST_LONG_EDGE,
-        "note": "Ingest proportional resize is ON by default (ingest_resize=1).",
+        "note": "Only /outpaint/mockup is exposed. Ingest proportional resize is ON by default.",
     }
 
 # =========================
@@ -104,14 +102,13 @@ def _resize_fit(img: Image.Image, target: Tuple[int, int]) -> Image.Image:
 
 def _ingest_simple_resize(file_bytes: bytes, enable: bool, max_long_edge: int) -> Image.Image:
     """
-    Proportional resize ONLY if the long edge exceeds max_long_edge.
+    Proportional resize ONLY if long edge exceeds max_long_edge.
     No padding/cropping; preserves aspect ratio exactly.
     """
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img)
     if not enable:
         return img.convert("RGBA")
-
     w, h = img.size
     long_edge = max(w, h)
     if long_edge > max_long_edge:
@@ -187,13 +184,9 @@ def _overlay_original_art(result_rgba: Image.Image, art_rgba: Image.Image,
     """
     x0, y0, x1, y1 = bbox
     if inset_px > 0:
-        x0 += inset_px
-        y0 += inset_px
-        x1 -= inset_px
-        y1 -= inset_px
-        if x1 <= x0 or y1 <= y0:
+        x0 += inset_px; y0 += inset_px; x1 -= inset_px; y1 -= inset_px
+        if x1 <= x0 or y1 <= y0:  # safety
             x0, y0, x1, y1 = bbox
-
     w, h = x1 - x0, y1 - y0
     if art_rgba.size != (w, h):
         art_rgba = art_rgba.resize((w, h), Image.LANCZOS)
@@ -243,96 +236,8 @@ def _openai_images_edit_multi(image_png: bytes, mask_png: bytes, prompt: str, n:
         raise HTTPException(status_code=502, detail=f"Image API returned no data: {js}")
     return [it.get("b64_json") for it in items if it.get("b64_json")]
 
-
 # =========================================================
-# Single-style endpoint
-# =========================================================
-@app.post("/outpaint/mockup_single")
-async def outpaint_mockup_single(
-    file: UploadFile = File(...),
-    style: str = Form("living_room"),
-    target_px: int = Form(DEFAULT_TARGET_PX),
-    pad_ratio: float = Form(0.42),
-    normalize_ratio: str = Form(""),
-    mat_pct: float = Form(0.0),
-    overlay_original: int = Form(0),          # default OFF to avoid seams
-    overlay_inset_px: int = Form(0),          # if overlay=1, set 1–3 to hide frame misalignment
-    # ingest proportional resize (simple & safe):
-    ingest_resize: int = Form(1),             # 💡 ON by default
-    ingest_max_long_edge: int = Form(DEFAULT_INGEST_LONG_EDGE),
-    return_format: str = Form("png"),
-    filename: str = Form("mockup_single"),
-):
-    if style not in STYLE_PROMPTS:
-        raise HTTPException(400, f"Unknown style '{style}'. Choose from {list(STYLE_PROMPTS.keys())}")
-
-    try:
-        raw = await file.read()
-        art = _ingest_simple_resize(raw, bool(ingest_resize), int(ingest_max_long_edge))
-    except Exception as e:
-        raise HTTPException(400, f"Could not read image: {e}")
-
-    if normalize_ratio:
-        try:
-            rw, rh = [int(x) for x in normalize_ratio.split(":")]
-            art, _ = _pad_to_ratio(art, rw, rh)
-        except Exception:
-            raise HTTPException(400, f"Invalid normalize_ratio '{normalize_ratio}'. Use '4:5', '3:4', '2:3'.")
-
-    if mat_pct and mat_pct > 0:
-        w, h = art.size
-        mx = int(w * mat_pct / 2.0); my = int(h * mat_pct / 2.0)
-        mat_canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        mat_canvas.paste(art, (mx, my), art)
-        art = mat_canvas
-
-    # Build canvas + mask from the same raster
-    canvas, keep_bbox = _pad_canvas_keep_center(art, pad_ratio=pad_ratio, target_side=target_px)
-    mask = _build_outpaint_mask(canvas.size, keep_bbox)
-
-    # Quantize to OpenAI size together
-    api_w, api_h, api_size_str = _api_edit_size_for(canvas.size)
-    canvas_api = canvas.resize((api_w, api_h), Image.LANCZOS)
-    mask_api   = mask.resize((api_w, api_h), Image.NEAREST)
-
-    prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
-    b64 = _openai_images_edit_multi(
-        _img_to_png_bytes(canvas_api),
-        _img_to_png_bytes(mask_api),
-        prompt=prompt,
-        n=1,
-        size_str=api_size_str,
-    )[0]
-
-    out = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
-    if out.size != canvas.size:
-        out = out.resize(canvas.size, Image.LANCZOS)
-
-    if overlay_original:
-        x0, y0, x1, y1 = keep_bbox
-        placed_art = canvas.crop((x0, y0, x1, y1))
-        out = _overlay_original_art(out, placed_art, keep_bbox, inset_px=max(0, int(overlay_inset_px)))
-
-    if return_format.lower() == "json":
-        buf = io.BytesIO(); out.save(buf, "PNG")
-        return JSONResponse({
-            "style": style,
-            "canvas_size": [canvas.width, canvas.height],
-            "art_bbox": keep_bbox,
-            "normalize_ratio": normalize_ratio,
-            "mat_pct": mat_pct,
-            "api_size": api_size_str,
-            "ingest_resize": int(ingest_resize),
-            "ingest_max_long_edge": int(ingest_max_long_edge),
-            "image_b64": base64.b64encode(buf.getvalue()).decode("utf-8")
-        })
-
-    buf = io.BytesIO(); out.save(buf, "PNG")
-    headers = {"Content-Disposition": f'inline; filename="{filename}_{style}.png"'}
-    return Response(content=buf.getvalue(), media_type="image/png", headers=headers)
-
-# =========================================================
-# Multi-style / multi-variant endpoint
+# Multi-style / multi-variant endpoint (ONLY)
 # =========================================================
 @app.post("/outpaint/mockup")
 async def outpaint_mockup(
@@ -343,13 +248,13 @@ async def outpaint_mockup(
     normalize_ratio: str = Form(""),
     mat_pct: float = Form(0.0),
     variants: int = Form(5),
-    overlay_original: int = Form(0),
-    overlay_inset_px: int = Form(0),
+    overlay_original: int = Form(0),          # default OFF to avoid seams
+    overlay_inset_px: int = Form(0),          # if overlay=1, set 1–3 to hide frame misalignment
     make_print_previews: int = Form(0),
     # ingest proportional resize (simple & safe):
-    ingest_resize: int = Form(1),             # 💡 ON by default
+    ingest_resize: int = Form(1),             # ON by default
     ingest_max_long_edge: int = Form(DEFAULT_INGEST_LONG_EDGE),
-    return_format: str = Form("json"),
+    return_format: str = Form("json"),        # json | png | zip
     filename: str = Form("mockup_bundle"),
 ):
     style_list = [s.strip() for s in styles.split(",") if s.strip()]
