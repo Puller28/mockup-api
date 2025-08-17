@@ -1,30 +1,41 @@
-# app.py — Outpainted Mockups (multi-only, alignment-safe, with debug flag)
+# app.py — Outpainted Mockups (low-memory ZIP, streaming-safe)
 # Endpoints:
 #   GET  /healthz
 #   POST /outpaint/mockup
 
 import io
 import os
+import gc
 import base64
 import zipfile
+import tempfile
 from math import ceil
 from typing import Dict, Tuple, List
 
 import requests
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps, ImageFile, ImageDraw
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = 200_000_000  # safety against huge uploads
 
 # =========================
-# Config / Presets
+# Server clamps / envs
 # =========================
+OPENAI_MODEL = os.getenv("OPENAI_IMAGES_MODEL", "gpt-image-1")
+
+# Hard caps to protect 512 MB instances
+CAP_VARIANTS_ZIP = int(os.getenv("CAP_VARIANTS_ZIP", "3"))
+CAP_TARGET_PX     = int(os.getenv("CAP_TARGET_PX", "2048"))
+CAP_INGEST_LONG   = int(os.getenv("CAP_INGEST_LONG", "2048"))
+
+# ZIP spooling: RAM until this many bytes; beyond that it spills to disk
+ZIP_SPOOL_MAX = int(os.getenv("ZIP_SPOOL_MAX", str(16 * 1024 * 1024)))  # 16 MB
 
 DEFAULT_TARGET_PX = int(os.getenv("TARGET_PX", "2048"))
 DEFAULT_INGEST_LONG_EDGE = int(os.getenv("INGEST_LONG_EDGE", "2048"))
-OPENAI_MODEL = os.getenv("OPENAI_IMAGES_MODEL", "gpt-image-1")
 
 STYLE_PROMPTS: Dict[str, str] = {
     "living_room": (
@@ -66,10 +77,9 @@ PRINT_SIZES: Dict[str, Tuple[int, int]] = {
 }
 
 # =========================
-# FastAPI app
+# FastAPI
 # =========================
-
-app = FastAPI(title="Outpainted Mockups (multi-only)", version="5.1")
+app = FastAPI(title="Outpainted Mockups (low-memory ZIP)", version="6.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -85,13 +95,17 @@ def healthz():
         "default_styles": DEFAULT_STYLE_LIST,
         "target_default": DEFAULT_TARGET_PX,
         "ingest_long_edge_default": DEFAULT_INGEST_LONG_EDGE,
-        "note": "Only /outpaint/mockup is exposed. Ingest proportional resize is ON by default.",
+        "caps": {
+            "variants_zip": CAP_VARIANTS_ZIP,
+            "target_px": CAP_TARGET_PX,
+            "ingest_long_edge": CAP_INGEST_LONG,
+            "zip_spool_max": ZIP_SPOOL_MAX,
+        }
     }
 
 # =========================
 # Helpers
 # =========================
-
 def _img_to_png_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, "PNG")
@@ -113,6 +127,7 @@ def _ingest_simple_resize(file_bytes: bytes, enable: bool, max_long_edge: int) -
     return img.convert("RGBA")
 
 def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0)):
+    img = img.convert("RGBA")
     w, h = img.size
     target_ratio = ratio_w / ratio_h
     src_ratio = w / h
@@ -135,6 +150,7 @@ def _pad_to_ratio(img: Image.Image, ratio_w: int, ratio_h: int, bg=(0, 0, 0, 0))
 def _pad_canvas_keep_center(img: Image.Image, pad_ratio: float, target_side: int):
     img = img.convert("RGBA")
     longest = max(img.size)
+    # upscale only (downscale is avoided to keep detail)
     if longest < target_side:
         scale = target_side / float(longest)
         img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
@@ -149,8 +165,8 @@ def _pad_canvas_keep_center(img: Image.Image, pad_ratio: float, target_side: int
 def _build_outpaint_mask(canvas_size: Tuple[int, int], keep_bbox: Tuple[int, int, int, int]) -> Image.Image:
     W, H = canvas_size
     x0, y0, x1, y1 = keep_bbox
-    alpha = Image.new("L", (W, H), 0)
-    keep  = Image.new("L", (x1 - x0, y1 - y0), 255)
+    alpha = Image.new("L", (W, H), 0)               # EDIT outside
+    keep  = Image.new("L", (x1 - x0, y1 - y0), 255) # KEEP inside
     alpha.paste(keep, (x0, y0))
     mask = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     mask.putalpha(alpha)
@@ -201,9 +217,9 @@ def _openai_images_edit_multi(image_png: bytes, mask_png: bytes, prompt: str, n:
         raise HTTPException(status_code=502, detail=f"Image API returned no data: {js}")
     return [it.get("b64_json") for it in items if it.get("b64_json")]
 
-# =========================================================
-# Multi-style / multi-variant endpoint
-# =========================================================
+# =========================
+# Endpoint (JSON or low-mem ZIP)
+# =========================
 @app.post("/outpaint/mockup")
 async def outpaint_mockup(
     file: UploadFile = File(...),
@@ -218,10 +234,14 @@ async def outpaint_mockup(
     make_print_previews: int = Form(0),
     ingest_resize: int = Form(1),
     ingest_max_long_edge: int = Form(DEFAULT_INGEST_LONG_EDGE),
-    return_format: str = Form("json"),
+    return_format: str = Form("json"),  # json | zip | png (png = first style/variant)
     filename: str = Form("mockup_bundle"),
-    debug_bbox: int = Form(0),   # NEW FLAG
+    debug_bbox: int = Form(0),
 ):
+    # ---- clamps to keep memory in check ----
+    ingest_max_long_edge = min(int(ingest_max_long_edge), CAP_INGEST_LONG)
+    target_px            = min(int(target_px), CAP_TARGET_PX)
+
     style_list = [s.strip() for s in styles.split(",") if s.strip()]
     invalid = [s for s in style_list if s not in STYLE_PROMPTS]
     if invalid:
@@ -230,7 +250,7 @@ async def outpaint_mockup(
         raise HTTPException(400, "No valid styles provided.")
 
     raw = await file.read()
-    art = _ingest_simple_resize(raw, bool(ingest_resize), int(ingest_max_long_edge))
+    art = _ingest_simple_resize(raw, bool(ingest_resize), ingest_max_long_edge)
 
     if normalize_ratio:
         rw, rh = [int(x) for x in normalize_ratio.split(":")]
@@ -251,49 +271,99 @@ async def outpaint_mockup(
     mask_api   = mask.resize((api_w, api_h), Image.NEAREST)
 
     one_style = len(style_list) == 1
-    n_per_style = max(1, min(int(variants), 10)) if one_style else 1
+    n_req = int(variants)
+    n_per_style = max(1, min(n_req, 10)) if one_style else 1
 
-    results: List[Dict[str, object]] = []
-
-    for style in style_list:
+    # quick PNG return (no ZIP, low memory)
+    if return_format.lower() == "png":
+        style = style_list[0]
         prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
         b64_list = _openai_images_edit_multi(
             _img_to_png_bytes(canvas_api), _img_to_png_bytes(mask_api),
             prompt=prompt, n=n_per_style, size_str=api_size_str
         )
+        img = Image.open(io.BytesIO(base64.b64decode(b64_list[0]))).convert("RGBA")
+        if img.size != canvas.size:
+            img = img.resize(canvas.size, Image.LANCZOS)
+        if overlay_original:
+            placed_art = canvas.crop(keep_bbox)
+            img = _overlay_original_art(img, placed_art, keep_bbox, inset_px=max(0, int(overlay_inset_px)))
+        buf = io.BytesIO(); img.save(buf, "PNG")
+        del img; gc.collect()
+        headers = {"Content-Disposition": f'inline; filename="{filename}_{style}_v01.png"'}
+        return Response(content=buf.getvalue(), media_type="image/png", headers=headers)
 
-        fixed_b64_list: List[str] = []
-        for b64 in b64_list:
-            img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
-            if img.size != canvas.size:
-                img = img.resize(canvas.size, Image.LANCZOS)
-            if overlay_original:
-                placed_art = canvas.crop(keep_bbox)
-                img = _overlay_original_art(img, placed_art, keep_bbox, inset_px=max(0, int(overlay_inset_px)))
-            buf = io.BytesIO(); img.save(buf, "PNG")
-            fixed_b64_list.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+    # JSON mode (kept as before)
+    if return_format.lower() == "json":
+        results: List[Dict[str, object]] = []
+        for style in style_list:
+            prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
+            b64_list = _openai_images_edit_multi(
+                _img_to_png_bytes(canvas_api), _img_to_png_bytes(mask_api),
+                prompt=prompt, n=n_per_style, size_str=api_size_str
+            )
+            fixed_b64_list: List[str] = []
+            for b64 in b64_list:
+                img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+                if img.size != canvas.size:
+                    img = img.resize(canvas.size, Image.LANCZOS)
+                if overlay_original:
+                    placed_art = canvas.crop(keep_bbox)
+                    img = _overlay_original_art(img, placed_art, keep_bbox, inset_px=max(0, int(overlay_inset_px)))
+                buf = io.BytesIO(); img.save(buf, "PNG")
+                fixed_b64_list.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+                del img, buf; gc.collect()
 
-            if debug_bbox:
-                dbg = img.copy()
-                draw = ImageDraw.Draw(dbg)
-                draw.rectangle(keep_bbox, outline="red", width=6)
-                buf_dbg = io.BytesIO(); dbg.save(buf_dbg, "PNG")
-                fixed_b64_list.append(base64.b64encode(buf_dbg.getvalue()).decode("utf-8"))
+            results.append({
+                "style": style,
+                "api_size": api_size_str,
+                "image_b64": fixed_b64_list[0],
+                "variants": fixed_b64_list,
+            })
 
-        results.append({
-            "style": style,
+        return JSONResponse({
+            "styles_requested": style_list,
+            "variants_per_style": n_per_style,
+            "canvas_size": [canvas.width, canvas.height],
+            "art_bbox": keep_bbox,
             "api_size": api_size_str,
-            "image_b64": fixed_b64_list[0],
-            "variants": fixed_b64_list,
+            "ingest_resize": int(ingest_resize),
+            "ingest_max_long_edge": int(ingest_max_long_edge),
+            "results": results,
         })
 
-    return JSONResponse({
-        "styles_requested": style_list,
-        "variants_per_style": n_per_style,
-        "canvas_size": [canvas.width, canvas.height],
-        "art_bbox": keep_bbox,
-        "api_size": api_size_str,
-        "ingest_resize": int(ingest_resize),
-        "ingest_max_long_edge": int(ingest_max_long_edge),
-        "results": results,
-    })
+    # ZIP mode — STREAMING & LOW-MEMORY
+    # Clamp variants harder in ZIP path
+    n_zip = min(n_per_style, CAP_VARIANTS_ZIP)
+
+    spool = tempfile.SpooledTemporaryFile(max_size=ZIP_SPOOL_MAX)
+    with zipfile.ZipFile(spool, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for style in style_list:
+            prompt = f"{PRESERVE_DIRECTIVE} {STYLE_PROMPTS[style]}"
+            # Generate ONLY n_zip images for this style
+            b64_list = _openai_images_edit_multi(
+                _img_to_png_bytes(canvas_api), _img_to_png_bytes(mask_api),
+                prompt=prompt, n=n_zip, size_str=api_size_str
+            )
+
+            # Write each variant immediately, then free memory
+            for idx, b64 in enumerate(b64_list, start=1):
+                img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+                if img.size != canvas.size:
+                    img = img.resize(canvas.size, Image.LANCZOS)
+                if overlay_original:
+                    placed_art = canvas.crop(keep_bbox)
+                    img = _overlay_original_art(img, placed_art, keep_bbox, inset_px=max(0, int(overlay_inset_px)))
+
+                buf = io.BytesIO(); img.save(buf, "PNG")
+                zf.writestr(f"{filename}_{style}_v{idx:02d}.png", buf.getvalue())
+
+                # free per-variant memory aggressively
+                del img, buf
+                gc.collect()
+
+    # prepare streaming response
+    spool.seek(0)
+    headers = {"Content-Disposition": f'attachment; filename="{filename}.zip"'}
+    # StreamingResponse will stream from the spooled file (disk if large)
+    return StreamingResponse(spool, media_type="application/zip", headers=headers)
