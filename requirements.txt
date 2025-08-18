@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-python-multipart
 pillow
-requests
-scikit-image
+opencv-python-headless
+numpy
