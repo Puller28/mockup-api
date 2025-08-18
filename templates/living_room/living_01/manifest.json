@@ -1,10 +1,15 @@
 {
   "id": "living_01",
+  "background": "living_01_bg.png",
   "width": 1024,
   "height": 1536,
-  "background": "living_01_bg.png",
-  "corners": [[322,304],[704,304],[704,749],[749,322]], 
-  "blend": { "mode": "multiply", "opacity": 0.96 }, 
-  "feather_px": 0.8,                                        
-  "pad_inset_px": 0 
+  "corners": [
+    [322, 304],
+    [704, 304],
+    [704, 749],
+    [322, 749]
+  ],
+  "blend": { "mode": "normal", "opacity": 1.0 },
+  "feather_px": 1.0,
+  "pad_inset_px": 0
 }
