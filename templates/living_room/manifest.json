@@ -1,0 +1,10 @@
+{
+  "id": "living_01",
+  "width": 1024,
+  "height": 1536,
+  "background": "templates/living_01_bg.png",
+  "corners": [[322,304],[704,304],[704,749],[749,322]],  // TL,TR,BR,BL
+  "blend": { "mode": "multiply", "opacity": 0.96 },         // or "normal"
+  "feather_px": 0.8,                                         // edge soften
+  "pad_inset_px": 0                                          // 2–4px adds a hairline gap
+}
